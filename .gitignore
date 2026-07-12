@@ -42,3 +42,7 @@ deploy_key.pem
 backtest_*.csv
 backtest_*.json
 optuna_studies.db
+
+# Web UI
+webui/frontend/node_modules/
+webui/frontend/dist/

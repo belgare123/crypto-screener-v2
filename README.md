@@ -239,6 +239,59 @@ optuna-dashboard sqlite:///optuna_studies.db
 | `optuna_trials.csv` | Full trial history |
 | `optuna_studies.db` | SQLite database (resumable) |
 
+```
+
+## Web UI (FastAPI + React)
+
+The platform includes a **Web UI** for strategy management and real-time metrics:
+
+- **URL:** `http://localhost:8001`
+- **Status:** [http://localhost:8001/api/health](http://localhost:8001/api/health)
+- **Docker service:** `webui` (FastAPI + React)
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Dashboard** | Real-time metrics via WebSocket: signals rate, blocked/dispatched counts, signal-by-symbol breakdown, blocked-by-reason chart |
+| **Strategy Management** | Browse all 54+ signals, filter by category/status/search, enable/disable live |
+| **Live WebSocket** | Server pushes metrics every ~5s from Prometheus |
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/health` | Service health |
+| `GET` | `/api/overview` | Aggregate metrics overview |
+| `GET` | `/api/strategies` | List all registered signals |
+| `GET` | `/api/strategies/categories` | Category counts |
+| `PATCH` | `/api/strategies/{name}` | Enable/disable a signal |
+| `GET` | `/api/metrics` | Raw Prometheus metrics |
+| `WS` | `/api/ws/metrics` | Real-time metric stream |
+
+### Local Development
+
+```bash
+# Backend
+cd webui
+pip install -r requirements.txt
+uvicorn webui.main:app --reload --port 8000
+
+# Frontend (separate terminal)
+cd webui/frontend
+npm install
+npm run dev     # → http://localhost:5173 (proxies /api to :8000)
+```
+
+### Docker
+
+The `webui` service is included in `docker-compose.override.yml`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+# → http://localhost:8001
+```
+
 ## License
 
 MIT

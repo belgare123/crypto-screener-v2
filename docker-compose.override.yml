@@ -40,6 +40,22 @@ services:
     networks:
       - monitoring
 
+  webui:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    image: crypto-screener-v2-webui:latest
+    container_name: webui
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
 volumes:
   prometheus_data:
   grafana_data:
