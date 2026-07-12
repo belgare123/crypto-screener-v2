@@ -1,0 +1,20 @@
+groups:
+  - name: screener_alerts
+    rules:
+      - alert: ScreenerDown
+        expr: up{job="screener"} == 0
+        for: 30s
+        annotations:
+          summary: "Crypto Screener is down"
+          description: "Prometheus target {{ $labels.job }} ({{ $labels.instance }}) has been down for >30s"
+
+      - alert: NoTradesForHour
+        expr: rate(screener_trades_total[1h]) == 0
+        for: 1h
+        annotations:
+          summary: "No trades in the last hour"
+
+      - alert: HighDrawdown
+        expr: screener_drawdown_pct > 10
+        annotations:
+          summary: "Drawdown exceeds 10%"

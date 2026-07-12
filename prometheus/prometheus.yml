@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  - job_name: 'screener'
+    static_configs:
+      - targets: ['screener:9120']
+    metrics_path: '/metrics'
+    scrape_interval: 5s

@@ -21,8 +21,12 @@ from signals import (
     _signal_registry,
 )
 from utils import SignalCooldown
+from core.monitoring.registry import get_metrics_registry
 
 logger = logging.getLogger(__name__)
+
+# Metrics shortcuts
+_metrics = get_metrics_registry()
 
 
 class SignalEngine:
@@ -154,6 +158,7 @@ class SignalEngine:
             result = await signal.check(ctx)
         except Exception:
             logger.exception("Signal '%s' crashed on %s", signal.meta.name, ctx.symbol)
+            _metrics.inc("signal_errors", labels={"signal": signal.meta.name, "symbol": ctx.symbol})
             return
 
         if result is None:
@@ -167,6 +172,7 @@ class SignalEngine:
 
         # Фильтр min_score
         if result.score < self._min_score:
+            _metrics.inc("signals_blocked", labels={"signal": signal.meta.name, "reason": "min_score"})
             return
 
         # Антиспам
@@ -176,7 +182,10 @@ class SignalEngine:
             result.score,
             cooldown=signal.meta.cooldown,
         ):
+            _metrics.inc("signals_blocked", labels={"signal": signal.meta.name, "reason": "cooldown"})
             return
+
+        _metrics.inc("signals_total", labels={"signal": signal.meta.name, "symbol": ctx.symbol})
 
         await self._signal_queue.put(result)
 

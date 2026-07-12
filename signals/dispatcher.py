@@ -8,8 +8,11 @@ from collections import defaultdict
 
 from core import SignalResult
 from utils import SignalCooldown
+from core.monitoring.registry import get_metrics_registry
 
 logger = logging.getLogger(__name__)
+
+_metrics = get_metrics_registry()
 
 class Dispatcher:
     """
@@ -67,6 +70,7 @@ class Dispatcher:
                 # Anti-spam: проверяем cooldown + degrade (не слать, если score не вырос)
                 sig_cd = getattr(sig, "cooldown", 1800) or 1800
                 if not self._cooldown.can_send(sig.signal_name, sig.symbol, sig.score, cooldown=sig_cd):
+                    _metrics.inc("dispatch_spam_blocked", labels={"signal": sig.signal_name})
                     continue
 
                 # Дедупликация внутри одного батча: если уже есть такой же сигнал
@@ -89,6 +93,7 @@ class Dispatcher:
 
             if batch and self._notifier:
                 logger.info("[dispatch] sending %d signal(s): %s", len(batch), ", ".join(f"{s.signal_name}({s.score})" for s in batch))
+                _metrics.inc("dispatched_signals", amount=len(batch))
                 try:
                     if len(batch) == 1:
                         sig = batch[0]
