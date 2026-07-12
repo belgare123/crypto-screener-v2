@@ -142,6 +142,31 @@ Register in config and it loads automatically on next run.
 | `GET /metrics` | Prometheus metrics |
 | `GET /` | Service info |
 
+## Hyperopt (Parameter Optimization)
+
+`run_hyperopt.py` — Optuna-based automatic parameter tuning for strategies.
+
+```bash
+# Optimize momentum_v2 parameters (50 trials, profit factor)
+python run_hyperopt.py --symbol BTC/USDT:USDT --interval 1m \
+    --start 2026-06-01 --end 2026-06-30 --metric profit_factor --n-trials 50
+
+# Quick grid search (no Optuna)
+python run_hyperopt.py \
+    --grid momentum_threshold=0.3,0.5,1.0 min_consecutive=2,4,6
+
+# Visualize results (requires optuna-dashboard)
+optuna-dashboard sqlite:///optuna_studies.db
+# → http://localhost:8080
+```
+
+**Outputs:**
+| File | Description |
+|---|---|
+| `best_params.json` | Best parameter set found |
+| `optuna_trials.csv` | Full trial history |
+| `optuna_studies.db` | SQLite database (resumable) |
+
 ## License
 
 MIT

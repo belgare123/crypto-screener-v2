@@ -45,6 +45,27 @@ class MomentumStrategy(BaseStrategy):
     CONSECUTIVE_MAX_SCORE = 40.0   # макс. баллов за consecutive
     CONTEXT_MAX_SCORE = 20.0       # макс. баллов за контекст
 
+    # ── Алиасы для удобства Hyperopt ──
+    PARAM_ALIASES = {
+        "momentum_threshold": "BASE_MIN_MOVE_PCT",
+        "min_consecutive": "CONSECUTIVE_MIN",
+        "lookback": None,  # ignored, not used by momentum_v2
+    }
+
+    def __init__(self, **params):
+        super().__init__()
+        # Override class-level attrs with passed params
+        for key, val in params.items():
+            # Resolve alias if needed
+            resolved = self.PARAM_ALIASES.get(key, key)
+            if resolved is None:
+                continue  # alias maps to None → ignore
+            if hasattr(self, resolved):
+                setattr(self, resolved, val)
+                logger.info("[momentum_v2] param %s = %s (from %s)", resolved, val, key)
+            else:
+                logger.debug("[momentum_v2] unknown param %s, ignored", key)
+
     async def evaluate(self, ctx: StrategyContext) -> StrategyResult | None:
         """Оценить стратегию Momentum для символа."""
         symbol = ctx.symbol

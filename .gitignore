@@ -36,3 +36,9 @@ market_replay.db*
 deploy_key.pem
 *.pem
 *.tar
+
+# Generated data
+*.parquet
+backtest_*.csv
+backtest_*.json
+optuna_studies.db

@@ -94,6 +94,54 @@ class OME:
     def total_exposure(self) -> float:
         return self.tracker.total_exposure
 
+    async def update_positions(self, price: float, timestamp: float | None = None) -> list[dict]:
+        """
+        Проверить позиции на SL/TP. Закрыть при достижении.
+
+        Returns
+        -------
+        list[dict]
+            Список закрытых сделок с информацией о PnL.
+        """
+        closed: list[dict] = []
+        for pos in self.tracker.all():
+            side_value = pos.side.value if hasattr(pos.side, "value") else str(pos.side)
+
+            if side_value == "buy":
+                hit_sl = pos.stop_loss > 0 and price <= pos.stop_loss
+                hit_tp = pos.take_profit > 0 and price >= pos.take_profit
+            else:
+                hit_sl = pos.stop_loss > 0 and price >= pos.stop_loss
+                hit_tp = pos.take_profit > 0 and price <= pos.take_profit
+
+            if not (hit_sl or hit_tp):
+                continue
+
+            exit_reason = "SL" if hit_sl else "TP"
+            # Manual PnL (unrealized_pnl is a dataclass field, not computed)
+            pnl = (
+                (price - pos.entry_price) * pos.size
+                if side_value == "buy"
+                else (pos.entry_price - price) * pos.size
+            )
+            self.tracker.close(pos.symbol, price=price)
+            trade = {
+                "ts": timestamp or 0,
+                "symbol": pos.symbol,
+                "side": side_value,
+                "exit_price": round(price, 2),
+                "entry_price": round(pos.entry_price, 2),
+                "qty": pos.size,
+                "pnl": round(pnl, 2),
+                "exit_reason": exit_reason,
+            }
+            closed.append(trade)
+            logger.info(
+                "[ome] CLOSE %s %s @ %.2f  PnL=%.4f",
+                exit_reason, pos.symbol, price, pnl,
+            )
+        return closed
+
 
 # Singleton
 _ome: OME | None = None

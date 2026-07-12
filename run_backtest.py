@@ -53,6 +53,7 @@ from core.consensus import (
 )
 from core.risk import RiskEngine, RiskContext
 from core.ome import OME
+from core.data_loader import load_klines
 
 # ── Auto-discover strategy modules ──
 def _discover_strategies():
@@ -128,6 +129,7 @@ class CandleSnapshot:
 
 
 def load_candles(symbol: str, start_ts: float, end_ts: float,
+                 interval: str = "1h",
                  replay_db: str = "market_replay.db",
                  limit: int = 500,
                  mode: str = "auto") -> list[CandleSnapshot]:
@@ -140,6 +142,38 @@ def load_candles(symbol: str, start_ts: float, end_ts: float,
       - synthetic: только генератор
     """
     candles: list[CandleSnapshot] = []
+
+    if mode == "parquet":
+        try:
+            df = load_klines(symbol, interval)
+            # Filter by time range (load_klines returns ms timestamps)
+            df = df[df["timestamp"] >= start_ts * 1000]
+            df = df[df["timestamp"] <= end_ts * 1000]
+            if df.empty:
+                logger.warning("[data] parquet empty for %s %s", symbol, interval)
+                return candles
+
+            logger.info("[data] loaded %d candles from Parquet (%s %s)", len(df), symbol, interval)
+            for _, row in df.iterrows():
+                ts_sec = row["timestamp"] / 1000.0  # ms → seconds
+                candle = CandleSnapshot(
+                    ts=ts_sec,
+                    close=row["close"],
+                    symbol=symbol,
+                    volume=row.get("volume", 100.0),
+                )
+                # Override OHL with real values from Parquet
+                candle.open = row.get("open", candle.close * 0.999)
+                candle.high = row.get("high", candle.close * 1.001)
+                candle.low = row.get("low", candle.close * 0.999)
+                candles.append(candle)
+            return candles
+        except FileNotFoundError:
+            logger.error("[data] parquet not found for %s %s — run data_downloader.py first", symbol, interval)
+            return []
+        except Exception as e:
+            logger.error("[data] parquet error: %s", e)
+            return []
 
     if mode in ("auto", "replay"):
         replay = MarketReplayEngine(replay_db)
@@ -306,10 +340,15 @@ class MockFeatureStore:
 class BacktestRunner:
     """Основной класс бэктеста."""
 
-    def __init__(self, capital: float = 1000.0, risk_pct: float = 0.01, mode: str = "auto"):
+    def __init__(self, capital: float = 1000.0, risk_pct: float = 0.01,
+                 mode: str = "auto", interval: str = "1h",
+                 start_ts: float | None = None, end_ts: float | None = None):
         self.capital = capital
         self.risk_pct = risk_pct
         self.mode = mode
+        self.interval = interval
+        self.start_ts = start_ts
+        self.end_ts = end_ts
 
         self.mock_store = MockFeatureStore()
         self.context_engine = ContextEngine(feature_engine=None)
@@ -321,17 +360,19 @@ class BacktestRunner:
         self.trades: list[dict] = []
         self.signals: list[dict] = []
 
-    def load_strategies(self, names: list[str] | None = None):
+    def load_strategies(self, names: list[str] | None = None, strategy_params: dict | None = None):
         if names is None:
             names = list(_strategy_registry.keys())
+        params = strategy_params or {}
         for name in names:
             cls = _strategy_registry.get(name)
             if cls is None:
                 logger.warning("[backtest] strategy '%s' not found", name)
                 continue
-            instance = cls()
+            instance = cls(**params)
             self.strategies.append((name, instance))
-            logger.info("[backtest] loaded strategy '%s'", name)
+            logger.info("[backtest] loaded strategy '%s'%s", name,
+                        f" with params={params}" if params else "")
         logger.info("[backtest] %d strategies loaded", len(self.strategies))
 
     async def run(
@@ -356,6 +397,7 @@ class BacktestRunner:
             symbol=symbol,
             start_ts=start_ts,
             end_ts=end_ts,
+            interval=self.interval,
             replay_db=replay_db,
             limit=limit,
             mode=self.mode,
@@ -662,8 +704,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Backtest Engine for crypto-screener-v2")
     parser.add_argument("--symbol", default="BTC/USDT:USDT",
                         help="Symbol (default: BTC/USDT:USDT)")
+    parser.add_argument("--interval", default="1h",
+                        choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
+                        help="Candle interval (default: 1h)")
     parser.add_argument("--days", type=int, default=1,
-                        help="Lookback days (default: 1)")
+                        help="Lookback days (default: 1; ignored if --start set)")
+    parser.add_argument("--start",
+                        help="Start date YYYY-MM-DD (overrides --days)")
+    parser.add_argument("--end",
+                        help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--limit", type=int, default=300,
                         help="Max candles (default: 300)")
     parser.add_argument("--replay-db", default="market_replay.db",
@@ -674,10 +723,14 @@ def parse_args():
                         help="Risk per trade (default: 0.01 = 1%%)")
     parser.add_argument("--strategy", nargs="*", default=None,
                         help="Strategy name(s) (default: all)")
-    parser.add_argument("--mode", choices=["auto", "synthetic", "replay"], default="auto",
-                        help="Data mode: auto (DB→fallback to synthetic), synthetic, replay (default: auto)")
+    parser.add_argument("--mode", choices=["auto", "parquet", "synthetic", "replay"], default="auto",
+                        help="Data mode: auto (DB→synthetic), parquet, synthetic, replay (default: auto)")
     parser.add_argument("--list-strategies", action="store_true",
                         help="List available strategies")
+    parser.add_argument("--strategy-params", type=str, default="{}",
+                        help='JSON with strategy params (e.g. \'{"min_consecutive":5}\')')
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress detailed output (for hyperopt)")
     return parser.parse_args()
 
 
@@ -692,15 +745,36 @@ async def main():
         print()
         return
 
-    runner = BacktestRunner(capital=args.capital, risk_pct=args.risk_pct, mode=args.mode)
-    runner.load_strategies(args.strategy)
+    # Date range
+    now = time.time()
+    if args.start:
+        start_dt = pd.to_datetime(args.start)
+        start_ts = start_dt.timestamp()
+    else:
+        start_ts = now - args.days * 86400
+    if args.end:
+        end_dt = pd.to_datetime(args.end)
+        end_ts = end_dt.timestamp() + 86400  # inclusive: end of day
+    else:
+        end_ts = now
+
+    # Parse strategy params
+    strategy_params = json.loads(args.strategy_params) if args.strategy_params else {}
+    if not isinstance(strategy_params, dict):
+        logger.error("--strategy-params must be a JSON object")
+        sys.exit(1)
+
+    if args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+
+    runner = BacktestRunner(
+        capital=args.capital, risk_pct=args.risk_pct, mode=args.mode,
+        interval=args.interval, start_ts=start_ts, end_ts=end_ts,
+    )
+    runner.load_strategies(args.strategy, strategy_params=strategy_params)
     if not runner.strategies:
         logger.error("No strategies loaded — aborting")
         sys.exit(1)
-
-    now = time.time()
-    start_ts = now - args.days * 86400
-    end_ts = now
 
     stats = await runner.run(
         symbol=args.symbol,
@@ -719,6 +793,7 @@ async def main():
     else:
         print(f"  Symbol:         {args.symbol}")
         print(f"  Period:         {args.days}d  ({args.limit} candles)")
+        print(f"  Interval:       {args.interval}")
         print(f"  Mode:           {args.mode}")
         print(f"  Strategies:     {', '.join(n for n, _ in runner.strategies)}")
         print(f"  Capital:        ${args.capital:.2f}")
