@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.env
+.venv
+venv/
+ENV/
+env/
+*.log
+*.db
+*.sqlite3
+*.sqlite
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+data/
+logs/
+market_replay.db*
+*.pid
+.DS_Store
+
+# Docker
+*.tar
