@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -19,6 +20,13 @@ from webui.api.metrics import router as metrics_router
 
 logger = logging.getLogger(__name__)
 
+# Ensure the logger outputs somewhere — uvicorn doesn't configure module loggers
+if not logger.handlers and not logging.getLogger().handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+
 config = WebUIConfig()
 
 # Track WebSocket clients for live metrics
@@ -29,6 +37,7 @@ ws_clients: set[WebSocket] = set()
 async def lifespan(app: FastAPI):
     """Start background task for pushing metrics to WebSocket clients."""
     task = asyncio.create_task(_metrics_broadcaster())
+    task.add_done_callback(lambda t: logger.error("Broadcaster crashed: %s", t.exception() if t.exception() else "unknown"))
     yield
     task.cancel()
 
@@ -74,12 +83,16 @@ async def _metrics_broadcaster():
     import aiohttp
     from webui.api.metrics import fetch_prometheus
 
+    logger.warning("Metrics broadcaster started")
     while True:
         await asyncio.sleep(3)
+        logger.debug("Broadcaster tick: %d clients", len(ws_clients))
         if not ws_clients:
             continue
         try:
             data = await fetch_prometheus()
+            sb_count = len(data.get("signals_blocked", []))
+            logger.info("Broadcasting %d keys (blocked=%d)", len(data), sb_count)
             payload = json.dumps({"type": "metrics", "data": data})
             dead = set()
             for ws in ws_clients:
@@ -87,7 +100,7 @@ async def _metrics_broadcaster():
                     await ws.send_text(payload)
                 except Exception:
                     dead.add(ws)
-            ws_clients -= dead
+            ws_clients.difference_update(dead)
         except Exception:
             logger.exception("Metrics broadcaster error")
 

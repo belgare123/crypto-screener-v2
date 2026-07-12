@@ -383,3 +383,41 @@ aiogram 3.29+ использует `AiohttpSession(proxy="socks5://127.0.0.1:108
 | 18 | Noise Filter |
 | 19 | Market Replay |
 | 20 | Explainable AI |
+
+---
+
+## Технический долг
+
+### 1. Модуль `scanner/` (legacy)
+
+**Статус:** ⏳ Плановая замена в v0.6.0  
+**ADR:** [ADR-001: Отказ от scanner](docs/adr/001-scanner-deprecation.md)
+
+`scanner/` является временным слоем буферизации данных, который должен быть заменён на `core/storage/`. На момент v0.5.0 scanner используется в:
+
+- `run.py` — инициализация CandleBuffer, TickerStore, OrderBookState, TradeScanner и др.
+- `signals/engine.py` — data source для V1 SignalEngine (candle_buffer, ticker_store, orderbooks).
+- `api/__init__.py` — эндпоинты `/pairs` и `/whales/{symbol}`.
+- `smoke_test.py` и `tests/test_imports.py` — интеграционные тесты.
+
+**План миграции:** создать `core/storage/` с CandleStore, TickerStore, OBStore, TradeStore; мигрировать потребителей; удалить `scanner/`.
+
+### 2. Модуль `signals/` (V1 legacy)
+
+**Статус:** 🟡 Частично замещён V2 pipeline  
+**ADR:** [ADR-001: Отказ от scanner](docs/adr/001-scanner-deprecation.md)
+
+V1-сигналы (`signals/engine.py`, `signals/dispatcher.py`) дублируют вычисления `core/features/calculators/`. После полной миграции всех стратегий на V2 pipeline (FeatureEngine + StateEngine + Consensus + OME) модуль `signals/` будет удалён.
+
+### 3. Глобальные признаки (GlobalFeatureService)
+
+**Статус:** 📋 Запланировано  
+**ADR:** [ADR-002: Глобальный FeatureEngine](docs/adr/002-global-feature-engine.md)
+
+`MarketFeatureCalculator` и `CorrelationEngine` требуют данных по всем символам, но FeatureEngine работает в цикле по одному символу. Решение — вынести в отдельный `GlobalFeatureService` с периодическим обновлением раз в 60 секунд.
+
+### 4. Единый интерфейс Engine
+
+**Статус:** 🟡 Косметическое улучшение
+
+Не все движки наследуют `core/engine/Engine` (абстрактный базовый класс). Для единообразия стоит привести все 9 движков к единому интерфейсу (start/stop/shadow), но это не критично для функционирования.

@@ -116,31 +116,30 @@ export default function Dashboard() {
         <div className="bg-dark-800 rounded-xl border border-gray-800 p-4">
           <h2 className="text-sm font-semibold text-gray-300 mb-4">Signals by Symbol</h2>
           <div className="space-y-2">
-            {wsData?.signals_total
-              ?.reduce((acc: Record<string, number>, r) => {
+            {(() => {
+              const raw = wsData?.signals_total
+              if (!raw || raw.length === 0) return <div className="text-gray-500 text-sm">No data yet</div>
+              const grouped: Record<string, number> = {}
+              for (const r of raw) {
                 const sym = r.metric.symbol || 'unknown'
-                acc[sym] = (acc[sym] || 0) + parseFloat(r.value[1] || '0')
-                return acc
-              }, {})
-              ?.let?.(obj => {
-                if (!obj) return <div className="text-gray-500 text-sm">No data yet</div>
-                const entries = Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, 10)
-                if (entries.length === 0) return <div className="text-gray-500 text-sm">No data yet</div>
-                const maxVal = entries[0][1]
-                return entries.map(([sym, count]) => (
-                  <div key={sym} className="flex items-center gap-3">
-                    <span className="text-sm font-mono text-gray-300 w-28 truncate">{sym}</span>
-                    <div className="flex-1 bg-dark-600 rounded-full h-2">
-                      <div
-                        className="bg-blue-500 h-2 rounded-full transition-all"
-                        style={{ width: `${(count / maxVal) * 100}%` }}
-                      />
-                    </div>
-                    <span className="text-sm text-gray-400 w-12 text-right">{Math.round(count)}</span>
+                grouped[sym] = (grouped[sym] || 0) + parseFloat(r.value[1] || '0')
+              }
+              const entries = Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, 10)
+              if (entries.length === 0) return <div className="text-gray-500 text-sm">No data yet</div>
+              const maxVal = entries[0][1]
+              return entries.map(([sym, count]) => (
+                <div key={sym} className="flex items-center gap-3">
+                  <span className="text-sm font-mono text-gray-300 w-28 truncate">{sym}</span>
+                  <div className="flex-1 bg-dark-600 rounded-full h-2">
+                    <div
+                      className="bg-blue-500 h-2 rounded-full transition-all"
+                      style={{ width: `${(count / maxVal) * 100}%` }}
+                    />
                   </div>
-                ))
-              })
-            }
+                  <span className="text-sm text-gray-400 w-12 text-right">{Math.round(count)}</span>
+                </div>
+              ))
+            })()}
           </div>
         </div>
 
@@ -148,28 +147,27 @@ export default function Dashboard() {
         <div className="bg-dark-800 rounded-xl border border-gray-800 p-4">
           <h2 className="text-sm font-semibold text-gray-300 mb-4">Blocked by Reason</h2>
           <div className="space-y-2">
-            {wsData?.signals_blocked
-              ?.map((r, i) => ({ reason: r.metric.reason || 'unknown', count: parseFloat(r.value[1] || '0') }))
-              .sort((a, b) => b.count - a.count)
-              .map(({ reason, count }, _, arr) => {
-                const maxVal = arr[0]?.count || 1
-                return (
-                  <div key={reason} className="flex items-center gap-3">
-                    <span className="text-sm text-gray-300 w-28 capitalize">{reason}</span>
-                    <div className="flex-1 bg-dark-600 rounded-full h-2">
-                      <div
-                        className="bg-yellow-500 h-2 rounded-full transition-all"
-                        style={{ width: `${(count / maxVal) * 100}%` }}
-                      />
-                    </div>
-                    <span className="text-sm text-gray-400 w-12 text-right">{Math.round(count)}</span>
+            {(() => {
+              const raw = wsData?.signals_blocked
+              if (!raw || raw.length === 0) return <div className="text-gray-500 text-sm">No blocked signals</div>
+              const reasons = raw.map(r => ({
+                reason: r.metric.reason || 'unknown',
+                count: parseFloat(r.value[1] || '0'),
+              })).sort((a, b) => b.count - a.count)
+              const maxVal = reasons[0]?.count || 1
+              return reasons.map(({ reason, count }) => (
+                <div key={reason} className="flex items-center gap-3">
+                  <span className="text-sm text-gray-300 w-28 capitalize">{reason}</span>
+                  <div className="flex-1 bg-dark-600 rounded-full h-2">
+                    <div
+                      className="bg-yellow-500 h-2 rounded-full transition-all"
+                      style={{ width: `${(count / maxVal) * 100}%` }}
+                    />
                   </div>
-                )
-              })
-            }
-            {(!wsData?.signals_blocked || wsData.signals_blocked.length === 0) && (
-              <div className="text-gray-500 text-sm">No blocked signals</div>
-            )}
+                  <span className="text-sm text-gray-400 w-12 text-right">{Math.round(count)}</span>
+                </div>
+              ))
+            })()}
           </div>
         </div>
       </div>

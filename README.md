@@ -2,6 +2,8 @@
 
 **Modular cryptocurrency screening platform** — real-time market data pipeline with pluggable strategies, shadow-mode execution, and Docker deployment.
 
+> **v0.5.0 Baseline** — архитектурный аудит завершён. `scanner/` → legacy, замена в v0.6.0. Подробнее: [ADR-001](docs/adr/001-scanner-deprecation.md).
+
 [![Python](https://img.shields.io/badge/python-3.11-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 

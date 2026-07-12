@@ -29,7 +29,7 @@ class _Metric:
         self.created = time.time()
 
     def label_key(self) -> str:
-        return json.dumps(self.labels, sort_keys=True) if self.labels else ""
+        return json.dumps(self.labels, sort_keys=True) if self.labels is not None else "{}"
 
 
 class Counter(_Metric):
