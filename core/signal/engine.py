@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from core import SignalResult
 from core.consensus.models import ConsensusResult, SignalDirection, SignalVote
+from core.decision.models import Decision
 from core.risk.models import RiskVerdict, RiskContext, RiskResult
 from core.ome import OME, OrderSide, OrderType
 
@@ -26,6 +27,7 @@ class SignalEngine:
 
     def __init__(self, risk_engine=None, ome: OME | None = None,
                  notifier=None, metrics_registry=None,
+                 decision_engine=None,
                  cooldown_default: int = 1800,
                  shadow: bool = True):
         """
@@ -34,6 +36,7 @@ class SignalEngine:
             ome: OME для расчёта qty + SL/TP (может быть None)
             notifier: TelegramNotifier для отправки
             metrics_registry: MetricsRegistry для логов
+            decision_engine: DecisionEngine для адаптивных порогов + динамических SL/TP
             cooldown_default: антиспам в секундах
             shadow: если True — не отправляет реально
         """
@@ -41,6 +44,7 @@ class SignalEngine:
         self.ome = ome
         self.notifier = notifier
         self.metrics = metrics_registry
+        self.decision_engine = decision_engine
         self.cooldown_default = cooldown_default
         self.shadow = shadow
 
@@ -69,7 +73,24 @@ class SignalEngine:
 
         direction_str = direction.value
 
-        # 1. Cooldown check
+        # 1. DecisionEngine (adaptive thresholds + SL/TP)
+        decision: Decision | None = None
+        if self.decision_engine:
+            decision = await self.decision_engine.evaluate(symbol, consensus)
+            if not decision.is_actionable:
+                if self.metrics:
+                    self.metrics.inc("signal_decision_blocked",
+                                     labels={"symbol": symbol, "reason": decision.reason})
+                logger.debug("[signal] %s blocked by decision: %s", symbol, decision.reason)
+                return None
+            # Используем SL/TP из DecisionEngine (если есть) для OME
+            decision_sl = decision.sl
+            decision_tp = decision.tp
+        else:
+            decision_sl = None
+            decision_tp = None
+
+        # 2. Cooldown check
         cd_key = f"{symbol}:{signal_name}"
         if self._check_cooldown(cd_key):
             if self.metrics:
@@ -106,6 +127,8 @@ class SignalEngine:
                 side=direction_str,
                 price=price,
                 atr=atr,
+                override_sl=decision_sl,
+                override_tp=decision_tp,
             )
 
         # 4. Build SignalResult
@@ -118,6 +141,11 @@ class SignalEngine:
             "votes": consensus.total_votes,
             "buy_ratio": round(consensus.buy_ratio, 2),
         }
+        if decision is not None:
+            meta.update({
+                "decision_threshold": round(decision.threshold, 1),
+                "decision_reason": decision.reason,
+            })
         if ome_result:
             meta.update({
                 "qty": ome_result["sizer"]["qty"],
@@ -195,6 +223,7 @@ _engine: SignalEngine | None = None
 
 def get_signal_engine(risk_engine=None, ome: OME | None = None,
                       notifier=None, metrics_registry=None,
+                      decision_engine=None,
                       shadow: bool = True) -> SignalEngine:
     global _engine
     if _engine is None:
@@ -203,6 +232,7 @@ def get_signal_engine(risk_engine=None, ome: OME | None = None,
             ome=ome,
             notifier=notifier,
             metrics_registry=metrics_registry,
+            decision_engine=decision_engine,
             shadow=shadow,
         )
     return _engine

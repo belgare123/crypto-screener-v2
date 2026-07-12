@@ -1,13 +1,24 @@
-"""Settings DB — per-user настройки для Telegram бота."""
+"""
+Settings DB — per-user настройки для Telegram бота.
+
+v0.9.0:
+  - aiosqlite с постоянным соединением (без open/close на каждый запрос)
+  - close() для graceful shutdown
+  - Threading.Lock заменён на asyncio.Lock
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from pathlib import Path
-from threading import Lock
 from typing import Any
+
+try:
+    import aiosqlite
+    HAS_AIOSQLITE = True
+except ImportError:
+    HAS_AIOSQLITE = False
 
 logger = logging.getLogger(__name__)
 
@@ -22,44 +33,55 @@ DEFAULT_SETTINGS = {
 
 
 class UserSettingsDB:
-    """SQLite-хранилище настроек для каждого chat_id (синхронное, sqlite3)."""
+    """SQLite-хранилище настроек для каждого chat_id (async, aiosqlite)."""
 
     def __init__(self, db_path: str | Path):
         self._path = Path(db_path)
-        self._lock = Lock()
-        self._init_db()
+        self._conn: aiosqlite.Connection | None = None
 
-    def _init_db(self):
+    async def start(self):
+        """Открыть соединение (вызывается при старте)."""
+        if not HAS_AIOSQLITE:
+            logger.error("aiosqlite not installed — UserSettingsDB disabled")
+            return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, sqlite3.connect(str(self._path)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_settings (
-                    chat_id     INTEGER PRIMARY KEY,
-                    settings    TEXT NOT NULL DEFAULT '{}',
-                    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-                )
-            """)
-            conn.commit()
-        logger.info("UserSettingsDB ready at %s", self._path)
+        self._conn = await aiosqlite.connect(str(self._path))
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                chat_id     INTEGER PRIMARY KEY,
+                settings    TEXT NOT NULL DEFAULT '{}',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        await self._conn.commit()
+        logger.info("UserSettingsDB ready at %s (async)", self._path)
 
-    def get(self, chat_id: int) -> dict[str, Any]:
+    async def close(self):
+        """Закрыть соединение (при shutdown)."""
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+            logger.info("UserSettingsDB closed")
+
+    async def get(self, chat_id: int) -> dict[str, Any]:
         defaults = dict(DEFAULT_SETTINGS)
-        with self._lock, sqlite3.connect(str(self._path)) as conn:
-            row = conn.execute(
-                "SELECT settings FROM user_settings WHERE chat_id = ?",
-                (chat_id,),
-            ).fetchone()
+        if not self._conn:
+            return defaults
+        row = await self._conn.execute_fetchall(
+            "SELECT settings FROM user_settings WHERE chat_id = ?",
+            (chat_id,),
+        )
         if row:
-            saved = json.loads(row[0])
+            saved = json.loads(row[0][0])
             defaults.update(saved)
         return defaults
 
-    def set(self, chat_id: int, key: str, value: Any) -> dict[str, Any]:
-        current = self.get(chat_id)
+    async def set(self, chat_id: int, key: str, value: Any) -> dict[str, Any]:
+        current = await self.get(chat_id)
         current[key] = value
-        with self._lock, sqlite3.connect(str(self._path)) as conn:
-            conn.execute(
+        if self._conn:
+            await self._conn.execute(
                 """INSERT INTO user_settings (chat_id, settings, updated_at)
                    VALUES (?, ?, datetime('now'))
                    ON CONFLICT(chat_id) DO UPDATE SET
@@ -67,15 +89,16 @@ class UserSettingsDB:
                        updated_at = datetime('now')""",
                 (chat_id, json.dumps(current)),
             )
-            conn.commit()
+            await self._conn.commit()
         return current
 
-    def get_all(self) -> list[dict[str, Any]]:
+    async def get_all(self) -> list[dict[str, Any]]:
         """Все пользователи и их настройки (для статистики)."""
-        with self._lock, sqlite3.connect(str(self._path)) as conn:
-            rows = conn.execute(
-                "SELECT chat_id, settings FROM user_settings"
-            ).fetchall()
+        if not self._conn:
+            return []
+        rows = await self._conn.execute_fetchall(
+            "SELECT chat_id, settings FROM user_settings"
+        )
         result = []
         for chat_id, sjson in rows:
             s = json.loads(sjson)

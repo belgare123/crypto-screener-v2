@@ -10,14 +10,23 @@ Level 3 в архитектуре ARCHITECTURE_V2.md.
 
 Из core/session.py:
 - текущая торговая сессия
+
+ReactiveContextEngine:
+- TTL-кэш MarketContext по символу
+- Автоинвалидация при обновлении regime.* / vol.* через FeatureStore observers
+- Подписка на MarketDataBus для немедленного обновления (опционально)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from core import MarketDataBus
+from core.features.store import FeatureStore, get_feature_store
 from core.session import (
     SessionType,
     get_current_session_type,
@@ -73,38 +82,144 @@ class MarketContext:
 
 
 # ──────────────────────────────────────────────
-#  ContextEngine
+#  CachedContext — один элемент кэша
+# ──────────────────────────────────────────────
+
+
+class CachedContext:
+    """Кэшированный MarketContext с TTL и флагом stale."""
+
+    __slots__ = ("context", "created_at", "expires_at", "stale")
+
+    def __init__(self, context: MarketContext, ttl: float):
+        now = time.time()
+        self.context = context
+        self.created_at = now
+        self.expires_at = now + ttl if ttl > 0 else 0.0
+        self.stale = False  # помечен устаревшим по событию (FeatureStore observer)
+
+    @property
+    def is_valid(self) -> bool:
+        """Жив ли кэш: не протух по TTL и не помечен stale."""
+        if self.stale:
+            return False
+        if 0 < self.expires_at < time.time():
+            return False
+        return True
+
+
+# ──────────────────────────────────────────────
+#  ContextEngine — реактивный контекстный движок
 # ──────────────────────────────────────────────
 
 
 class ContextEngine:
     """
-    Контекстный движок — собирает MarketContext из FeatureStore + SessionEngine.
+    Контекстный движок с реактивным кэшированием.
+
+    - Кэширует MarketContext по символу (TTL по умолчанию 30 с)
+    - Подписывается на FeatureStore observers для regime.* и vol.*
+    - Автоматически инвалидирует кэш при обновлении релевантных фич
+    - Опционально подписывается на MarketDataBus для событийной инвалидации
 
     Usage:
-        engine = ContextEngine(feature_engine)
+        engine = ContextEngine(feature_store, session_engine)
+        await engine.start()           # подписка на observers
         ctx = await engine.get_context("BTC/USDT:USDT")
+        await engine.stop()            # отписка
     """
 
-    def __init__(self, feature_engine=None, session_engine=None):
-        from core.features import get_feature_engine
+    FEATURE_DEPS = [
+        "regime.trend",
+        "vol.regime",
+        "vol.regime_score",
+        "regime.volatility_state",
+    ]
 
-        self._fe = feature_engine or get_feature_engine()
-        self._se = session_engine  # SessionEngine (опционально, тикается из run.py)
+    def __init__(
+        self,
+        feature_store: FeatureStore | None = None,
+        session_engine=None,
+        bus: MarketDataBus | None = None,
+        default_ttl: float = 30.0,
+    ):
+        self._fs = feature_store or get_feature_store()
+        self._se = session_engine
+        self._bus = bus
+        self._default_ttl = default_ttl
+        self._cache: dict[str, CachedContext] = {}
+        self._lock = asyncio.Lock()
+        self._running = False
+
+    # ── Lifecycle ──
+
+    async def start(self):
+        """Подписаться на FeatureStore observers."""
+        if self._running:
+            return
+        self._running = True
+        self._fs.observe_prefix("regime.", self._on_feature_update)
+        self._fs.observe_prefix("vol.", self._on_feature_update)
+        logger.info("[ctx] ContextEngine started (TTL=%ss, deps=%s)",
+                     self._default_ttl, self.FEATURE_DEPS)
+
+    async def stop(self):
+        """Отписаться от observers и очистить кэш."""
+        if not self._running:
+            return
+        self._running = False
+        # Prefix observers хранятся с ключом ("*", prefix) в FeatureStore
+        self._fs.unobserve("*", "regime.", self._on_feature_update)
+        self._fs.unobserve("*", "vol.", self._on_feature_update)
+        self._cache.clear()
+        logger.info("[ctx] ContextEngine stopped")
+
+    # ── Observer — auto-invalidation ──
+
+    async def _on_feature_update(self, symbol: str, name: str, value: Any):
+        """FeatureStore обновил regime.* или vol.* — помечаем кэш stale."""
+        if not self._running:
+            return
+        async with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and not cached.stale:
+                cached.stale = True
+                logger.debug("[ctx] invalidated %s due to %s=%s", symbol, name, value)
+
+    # ── Core API ──
 
     async def get_context(self, symbol: str) -> MarketContext:
-        """Собрать контекст для символа."""
-        ctx = MarketContext(symbol=symbol)
+        """
+        Собрать контекст для символа с кэшированием.
 
-        if self._fe is None:
-            return ctx
+        Если в кэше есть валидный MarketContext — возвращает его.
+        Иначе пересобирает из FeatureStore + SessionEngine.
+        """
+        # Быстрый путь: кэш попадание
+        async with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and cached.is_valid:
+                return cached.context
+
+        # Кэш промах или устарел — собираем заново
+        ctx = await self._build_context(symbol)
+
+        # Сохраняем в кэш
+        async with self._lock:
+            self._cache[symbol] = CachedContext(ctx, self._default_ttl)
+
+        return ctx
+
+    async def _build_context(self, symbol: str) -> MarketContext:
+        """Собрать MarketContext из FeatureStore + SessionEngine."""
+        ctx = MarketContext(symbol=symbol)
 
         # ── Читаем фичи из FeatureStore ──
         try:
-            trend_f = await self._fe.get_feature(symbol, "regime.trend")
-            vol_f = await self._fe.get_feature(symbol, "vol.regime")
-            score_f = await self._fe.get_feature(symbol, "vol.regime_score")
-            vol_state = await self._fe.get_feature(symbol, "regime.volatility_state")
+            trend_f = await self._fs.get(symbol, "regime.trend")
+            vol_f = await self._fs.get(symbol, "vol.regime")
+            score_f = await self._fs.get(symbol, "vol.regime_score")
+            vol_state = await self._fs.get(symbol, "regime.volatility_state")
         except Exception:
             logger.debug("[ctx] no features yet for %s", symbol, exc_info=True)
             trend_f = vol_f = score_f = vol_state = None
@@ -118,7 +233,7 @@ class ContextEngine:
         if vol_state is not None:
             ctx.volatility_state = str(vol_state)
 
-        # ── Сессия (используем переданный SE или синглтон) ──
+        # ── Сессия ──
         try:
             se = self._se or get_session_engine()
             ctx.session = se.current.value
@@ -138,16 +253,58 @@ class ContextEngine:
 
         return ctx
 
+    # ── Cache management ──
+
+    async def invalidate(self, symbol: str | None = None):
+        """
+        Принудительная инвалидация кэша.
+
+        - Без аргументов: очищает весь кэш
+        - С symbol: удаляет только запись для указанного символа
+        """
+        async with self._lock:
+            if symbol:
+                self._cache.pop(symbol, None)
+            else:
+                self._cache.clear()
+
+    @property
+    def cache_size(self) -> int:
+        """Количество закэшированных контекстов."""
+        return len(self._cache)
+
+    async def cache_stats(self) -> dict:
+        """Статистика кэша для мониторинга."""
+        now = time.time()
+        valid = 0
+        expired = 0
+        stale = 0
+        async with self._lock:
+            for c in self._cache.values():
+                if c.stale:
+                    stale += 1
+                elif 0 < c.expires_at < now:
+                    expired += 1
+                else:
+                    valid += 1
+        return {
+            "total": len(self._cache),
+            "valid": valid,
+            "expired": expired,
+            "stale": stale,
+            "default_ttl": self._default_ttl,
+        }
+
 
 # ──────────────────────────────────────────────
-#  Global singleton
+#  Global singleton (backward compat)
 # ──────────────────────────────────────────────
 
 _context_engine: ContextEngine | None = None
 
 
 def get_context_engine() -> ContextEngine:
-    """Глобальный синглтон ContextEngine."""
+    """Глобальный синглтон ContextEngine (backward compat)."""
     global _context_engine
     if _context_engine is None:
         _context_engine = ContextEngine()
@@ -155,5 +312,6 @@ def get_context_engine() -> ContextEngine:
 
 
 def reset_context_engine():
+    """Сброс синглтона (для тестов)."""
     global _context_engine
     _context_engine = None

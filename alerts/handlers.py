@@ -208,7 +208,7 @@ def _fmt_help() -> str:
 
 async def cmd_start(message: Message):
     sdb: UserSettingsDB = router.settings_db
-    sdb.get(message.chat.id)  # создаёт запись если нет
+    await sdb.get(message.chat.id)  # создаёт запись если нет
     await message.answer(
         f"🚀 <b>Crypto Screener v2</b>\n\n"
         f"Привет, {message.from_user.first_name or 'трейдер'}! "
@@ -228,7 +228,7 @@ async def cmd_help(message: Message):
 
 async def cmd_settings(message: Message):
     sdb: UserSettingsDB = router.settings_db
-    s = sdb.get(message.chat.id)
+    s = await sdb.get(message.chat.id)
     await message.answer(
         _fmt_settings(s),
         parse_mode="HTML",
@@ -243,7 +243,7 @@ async def callback_handler(call: CallbackQuery):
     data = call.data
     sdb: UserSettingsDB = router.settings_db
     chat_id = call.message.chat.id
-    s = sdb.get(chat_id)
+    s = await sdb.get(chat_id)
 
     # ── Главное меню ──
     if data == CB_MENU:
@@ -342,8 +342,8 @@ async def callback_handler(call: CallbackQuery):
             typed = float(value)
         elif key == "min_score":
             typed = int(value)
-        sdb.set(chat_id, key, typed)
-        s = sdb.get(chat_id)
+        await sdb.set(chat_id, key, typed)
+        s = await sdb.get(chat_id)
         await call.message.edit_text(
             _fmt_settings(s), parse_mode="HTML",
             reply_markup=settings_keyboard(s),

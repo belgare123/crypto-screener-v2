@@ -149,32 +149,45 @@ class FeatureEngine:
         symbol: str,
         name: str,
         auto_compute: bool = True,
+        batch_updater=None,
     ) -> Any | None:
         """
         Получить значение признака.
+
+        Режим stale-while-revalidate:
+          — если фича есть (даже протухшая) → возвращаем значение и
+            планируем фоновый refresh через batch_updater
+          — если фичи нет → возвращаем None
 
         Args:
             symbol: тикер (напр. 'BTC/USDT:USDT')
             name: имя признака (напр. 'rsi.14', 'whale.trades')
             auto_compute: если True — принудительно пересчитать при протухании
+                          (фоновый refresh, не блокирующий)
+            batch_updater: BatchFeatureUpdater для фонового refresh
 
         Returns:
             значение признака или None, если недоступен
         """
-        value = await self.store.get(symbol, name, _NO_DEFAULT)
-        if value is not _NO_DEFAULT:
-            return value
-
-        # Фича отсутствует или протухла — пробуем пересчитать
-        if not auto_compute:
+        # Получаем значение со stale-поддержкой
+        value = await self.store.get_stale(symbol, name)
+        if value is None:
+            # Фичи никогда не было
+            if not auto_compute:
+                return None
+            if batch_updater is not None:
+                await batch_updater.schedule(symbol, priority=1)
             return None
 
-        calc = self._calc_by_feature.get(name)
-        if calc is None:
-            return None
+        # Проверяем свежесть
+        entry = await self.store.get_raw(symbol, name)
+        if entry is not None and not entry.is_expired:
+            return value  # свежее
 
-        await calc.compute_if_expired(symbol)
-        return await self.store.get(symbol, name)
+        # Фича протухла, но есть stale-значение
+        if auto_compute and batch_updater is not None:
+            await batch_updater.schedule(symbol, priority=1)
+        return value
 
     async def get_multi(
         self,
@@ -225,6 +238,41 @@ class FeatureEngine:
     ) -> dict[str, Any]:
         """Получить все фичи с префиксом (из кэша, без пересчёта)."""
         return await self.store.get_by_pattern(name_prefix, symbol)
+
+    # ── Batch refresh ──
+
+    async def refresh_symbols(self, symbols: list[str]):
+        """Обновить признаки для списка символов через batch-методы
+        калькуляторов.
+
+        Вызывается BatchFeatureUpdater._flush().
+        Каждый калькулятор получает полный список символов → compute_batch()
+        → атомарная запись через store.set_multi().
+
+        Args:
+            symbols: список тикеров для обновления
+        """
+        for calc in self._calculators:
+            try:
+                results = await calc.compute_batch(symbols)
+                if not results:
+                    continue
+                # Собираем все (symbol, name, value) для batch-записи
+                items: list[tuple[str, str, Any]] = []
+                for symbol, features in results.items():
+                    for name, value in features.items():
+                        items.append((symbol, name, value))
+                if items:
+                    await self.store.set_multi(items, ttl=calc.default_ttl)
+                    logger.debug(
+                        "[feat] refresh_symbols: %s wrote %d values for %d symbols",
+                        calc.__class__.__name__, len(items), len(results),
+                    )
+            except Exception:
+                logger.exception(
+                    "[feat] calculator '%s' refresh_symbols error",
+                    calc.__class__.__name__,
+                )
 
     # ── Observer API (делегировано FeatureStore) ──
 

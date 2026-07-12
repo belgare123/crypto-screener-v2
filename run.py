@@ -172,15 +172,11 @@ async def main():
             return sn.symbol_sectors.get(sym, "other")
         return "other"
 
-    # ── 12. Signal Engine ──
-    from signals.engine import SignalEngine
-    from signals.dispatcher import Dispatcher
-    from scanner.volume_screener import VolumeScreener
+    # ── 12. Signal Engine (V2) ──
+    from core.signal.engine import SignalEngine as SignalEngineV2
 
-    engine = SignalEngine(
-        bus=bus,
-        min_score=40.0,
-    )
+    signal_engine_v2 = SignalEngineV2(shadow=False)
+    logger.info("[v2] SignalEngineV2 initialised (active mode)")
 
     # ── 12b. Feature Engine — централизованный слой признаков ──
     try:
@@ -216,17 +212,17 @@ async def main():
     logger.info("[data] DataEngine started — exchanges: bybit, binance, okx")
 
     # ── 12f. Risk Engine — пре-трейд фильтрация ──
-    risk_engine = get_risk_engine(shadow=True)
+    risk_engine = get_risk_engine(shadow=False)
     risk_engine.add_rule(SpreadRule())
     risk_engine.add_rule(ATRRule())
     risk_engine.add_rule(LiquidityRule())
     risk_engine.add_rule(SessionRule())
-    logger.info("[risk] RiskEngine shadow=%s rules=%d", risk_engine.shadow, len(risk_engine._rules))
+    logger.info("[risk] RiskEngine rules=%d", len(risk_engine._rules))
 
     # ── 12g. Consensus Engine — взвешенное голосование стратегий ──
-    consensus_engine = get_consensus_engine(shadow=True)
+    consensus_engine = get_consensus_engine(shadow=False)
     opportunity_rank = OpportunityRanking(window_minutes=10, top_k=3)
-    logger.info("[consensus] ConsensusEngine shadow=%s ranking=10m/3top", consensus_engine.shadow)
+    logger.info("[consensus] ConsensusEngine ranking=10m/3top")
 
     # ── 12h. Metrics & Healthcheck — Observability ──
     metrics_registry = get_metrics_registry()
@@ -243,16 +239,15 @@ async def main():
     metrics_server = MetricsServer(host="0.0.0.0", port=9120)
     await metrics_server.start()
 
-    # ── 12i. OME — Order Management Engine (shadow) ──
-    ome = get_ome(shadow=True, capital=1000.0, risk_pct=0.01)
-    logger.info("[ome] OME shaded mode — capital=%.0f risk_pct=%.2f", ome.capital, ome.sizer.risk_pct)
+    # ── 12i. OME — Order Management Engine ──
+    ome = get_ome(shadow=False, capital=1000.0, risk_pct=0.01)
+    logger.info("[ome] OME — capital=%.0f risk_pct=%.2f", ome.capital, ome.sizer.risk_pct)
 
     # ── 12j. Learning Engine — winrate tracking + dynamic weights ──
-    learning = get_learning_engine(shadow=True)
-    logger.info("[learning] LearningEngine shadow=%s min_trades=%d",
-               learning.shadow, learning.tracker.min_trades)
+    learning = get_learning_engine(shadow=False)
+    logger.info("[learning] LearningEngine min_trades=%d", learning.tracker.min_trades)
 
-    # ── 13. Dispatcher ──
+    # ── 13. Notifier ──
     from alerts.telegram import TelegramNotifier, get_notifier
     from config import settings
 
@@ -260,12 +255,7 @@ async def main():
         token=settings.telegram_token,
         chat_id=str(settings.telegram_chat_id),
     )
-
-    dispatcher = Dispatcher(
-        engine=engine,
-        notifier=notifier,
-        min_score=40.0,
-    )
+    # V1 Dispatcher removed in v0.10.0 — signals sent directly via notifier
 
     # ── 13b. Strategy Engine + Context Engine (L3+L4) ──
     import strategies.momentum_v2  # noqa: F401 — триггерит @register_strategy
@@ -277,28 +267,12 @@ async def main():
     strategy_engine = StrategyEngine(
         feature_engine=feature_engine,
         context_engine=context_engine,
-        signal_engine=engine,
+        notifier=notifier,
     )
     strategy_engine.register_all()
     logger.info("[strategy] Context+Strategy Engine ready (%d strategies)", len(strategy_engine._strategies))
-
-    # ── 13c. Volume Screener — мониторинг всех монет Bybit с объёмом >= $5M/день ──
-    volume_screener = VolumeScreener(min_turnover=5_000_000)
-
-    async def _volume_listener(ticker_row):
-        """Слушатель новых монет, превысивших $5M объёма."""
-        msg = (
-                f"🔊 *{ticker_row.display}*\n"
-                f"💰 Объём 24ч: ${ticker_row.turnover_m:.1f}M\n"
-                f"📊 Цена: ${ticker_row.last_price:.4f}  |  Изм: {ticker_row.price_change_24h:+.2f}%"
-            )
-        try:
-            await notifier.send_text(msg)
-            logger.info("[volume_screener] notified new coin: %s ($%.1fM)", ticker_row.symbol, ticker_row.turnover_m)
-        except Exception:
-            logger.exception("[volume_screener] notify error for %s", ticker_row.symbol)
-
-    volume_screener.add_listener(_volume_listener)
+    from strategies import set_strategy_engine as _set_se
+    _set_se(strategy_engine)
 
     # ── 14. Отладка — создать несколько сигналов ──
     from core import SignalResult
@@ -324,7 +298,7 @@ async def main():
 
     recorder = SignalRecorder(ticker_getter=_get_price)
     await recorder.start()
-    dispatcher.add_listener(recorder.on_signal)
+    notifier.register_signal_listener(recorder.on_signal)
 
     winchecker = WinRateChecker(ticker_getter=_get_price)
     await winchecker.start()
@@ -337,10 +311,6 @@ async def main():
     for s in scanners:
         await s.start()
     await notifier.start()
-    engine.load_signals()
-    await engine.start()
-    await dispatcher.start()
-    await volume_screener.start()
     await strategy_engine.start()
 
     # Подписка на топ-10 пар по USDT (Bybit linear)
@@ -378,6 +348,7 @@ async def main():
     settings_db_path = settings.database_url.replace("sqlite+aiosqlite:///", "")
     settings_db_dir = Path(settings_db_path).parent
     settings_db = UserSettingsDB(settings_db_dir / "user_settings.db")
+    await settings_db.start()
     router = setup_telegram_handlers(settings_db, notifier)
     await notifier.attach_router(router)
     await notifier.start_polling()
@@ -396,7 +367,7 @@ async def main():
             _recent_signals.pop(0)
         router._recent_signals = _recent_signals
 
-    dispatcher.add_listener(_on_signal_listener)
+    notifier.register_signal_listener(_on_signal_listener)
 
     logger.info("All systems running. Press Ctrl+C to stop.")
 
@@ -640,7 +611,7 @@ async def main():
                     snap = trend_engine.analyze(sym)
                     sig = trend_engine.to_signal(sym)
                     if sig:
-                        await engine.push_signal(sig)
+                        await notifier.send_signal(sig)
                         logger.info("[trend] %s signal: %.0f/100 (%.1f/%.1f)",
                                     sym.split("/")[0], sig.score, snap.trend_strength, snap.momentum)
                 except Exception:
@@ -658,9 +629,9 @@ async def main():
                 _sector_snap = sector_engine.scan(_rs[0]) if _rs and _rs[0] else None
                 sector_leader = _sector_snap.leading_sector if _sector_snap and _sector_snap.sectors else "?"
                 logger.info(
-                    "[lifecycle] status: session=%s signals=%d rs_top=%s sector=%s",
+                    "[lifecycle] status: session=%s strategies=%d rs_top=%s sector=%s",
                     session_engine.session_name,
-                    len(engine._signals),
+                    len(strategy_engine._strategies),
                     rs_top,
                     sector_leader,
                 )
@@ -702,7 +673,7 @@ async def main():
                     if snap:
                         sig = analysis_engine.to_signal(sym, current_price, prices, correlation_snapshot, noise_level)
                         if sig:
-                            await engine.push_signal(sig)
+                            await notifier.send_signal(sig)
                             from core.explainable_ai import _fmt as _make_explanation
                             explanation = _make_explanation(sig, None, t)
                             # Сохраняем объяснение в meta
@@ -744,31 +715,6 @@ async def main():
             except Exception:
                 logger.exception("[replay] ticker error")
 
-    async def volume_screener_ticker():
-        """Сканирование всех монет Bybit по объёму раз в 5 минут + сводка раз в 30 мин."""
-        cycle = 0
-        while True:
-            await volume_screener.run_loop()
-            cycle += 1
-            # Каждый 6-й цикл (30 мин) — отправляем сводку топ-10
-            if cycle % 6 == 0:
-                try:
-                    all_qualifying = volume_screener._known_symbols
-                    if all_qualifying:
-                        tickers = await volume_screener.scan()
-                        if tickers:
-                            top10 = tickers[:10]
-                            lines = ["📊 *Топ объёмов 24ч (Bybit USDT)*\n"]
-                            for i, t in enumerate(top10, 1):
-                                lines.append(
-                                    f"{i}. {t.display:15s}  ${t.turnover_m:>7.1f}M  "
-                                    f"${t.last_price:>8.4f}  {t.price_change_24h:+.2f}%"
-                                )
-                            lines.append(f"\nВсего {len(tickers)} монет с объёмом ≥ $5M")
-                            await notifier.send_text("\n".join(lines))
-                except Exception:
-                    logger.exception("[volume_screener] summary error")
-
     # ── 18. Запуск фоновых тасок ──
     ticker_tasks = [
         asyncio.create_task(health_check()),
@@ -782,7 +728,6 @@ async def main():
         asyncio.create_task(lifecycle_ticker()),
         asyncio.create_task(market_ticker()),
         asyncio.create_task(replay_ticker()),
-        asyncio.create_task(volume_screener_ticker()),
     ]
 
     shutdown_mgr = ShutdownManager()

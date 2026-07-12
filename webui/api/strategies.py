@@ -1,4 +1,4 @@
-"""Strategies API — list and manage registered signals."""
+"""Strategies API — list registered V2 strategies."""
 
 from __future__ import annotations
 
@@ -16,118 +16,64 @@ router = APIRouter(tags=["strategies"])
 
 class StrategySchema(BaseModel):
     name: str
-    description: str
-    category: str
-    enabled: bool
-    default_score: float
-    cooldown: int
+    description: str = ""
+    category: str = "v2"
+    enabled: bool = True
+    default_score: float = 0.0
+    cooldown: int = 0
     timeframes: list[str] | None = None
-
-
-class StrategyUpdate(BaseModel):
-    enabled: bool | None = None
-    default_score: float | None = None
-    cooldown: int | None = None
-
-
-# ── Internal helpers ──
-
-_imported = False
-
-
-def _ensure_signals_loaded():
-    """Импортируем signals чтобы заполнился реестр."""
-    global _imported
-    if _imported:
-        return
-    try:
-        import signals  # noqa: F401
-        _imported = True
-    except ImportError:
-        logger.warning("signals module not available — are we inside the project?")
-    except Exception as e:
-        logger.error("Failed to import signals: %s", e)
-
-
-def _get_registry():
-    _ensure_signals_loaded()
-    try:
-        from signals.base import list_signals, _signal_registry
-        return list_signals(), _signal_registry
-    except ImportError:
-        return {}, {}
 
 
 # ── Routes ──
 
 @router.get("/strategies", response_model=list[StrategySchema])
 async def list_strategies():
-    """List all registered signals with metadata."""
-    metas, _ = _get_registry()
+    """List all registered V2 strategies."""
+    from strategies import get_strategy_engine, list_strategies as ls
+    engine = get_strategy_engine()
     return [
         StrategySchema(
-            name=meta.name,
-            description=meta.description,
-            category=meta.category,
-            enabled=meta.enabled,
-            default_score=meta.default_score,
-            cooldown=meta.cooldown,
-            timeframes=meta.timeframes,
+            name=name,
+            description=getattr(s, "description", "") or "",
+            category="v2",
+            enabled=True,
+            default_score=getattr(s, "default_score", 0.0) or 0.0,
+            cooldown=getattr(getattr(s, "meta", None), "cooldown", 0) or 0,
+            timeframes=None,
         )
-        for meta in metas.values()
+        for name, s in engine._strategy_by_name.items()
     ]
 
 
 @router.get("/strategies/{name}", response_model=StrategySchema)
 async def get_strategy(name: str):
-    """Get a single signal by name."""
-    metas, _ = _get_registry()
-    meta = metas.get(name)
-    if not meta:
-        raise HTTPException(404, f"Signal '{name}' not found")
+    """Get a single strategy by name."""
+    from strategies import get_strategy_engine
+    engine = get_strategy_engine()
+    s = engine._strategy_by_name.get(name)
+    if s is None:
+        raise HTTPException(404, f"Strategy '{name}' not found")
     return StrategySchema(
-        name=meta.name,
-        description=meta.description,
-        category=meta.category,
-        enabled=meta.enabled,
-        default_score=meta.default_score,
-        cooldown=meta.cooldown,
-        timeframes=meta.timeframes,
+        name=name,
+        description=getattr(s, "description", "") or "",
+        category="v2",
+        enabled=True,
+        default_score=getattr(s, "default_score", 0.0) or 0.0,
+        cooldown=getattr(getattr(s, "meta", None), "cooldown", 0) or 0,
+        timeframes=None,
     )
 
 
 @router.patch("/strategies/{name}", response_model=StrategySchema)
-async def update_strategy(name: str, update: StrategyUpdate):
-    """Enable/disable a signal or update its parameters."""
-    metas, reg = _get_registry()
-    meta = metas.get(name)
-    if not meta:
-        raise HTTPException(404, f"Signal '{name}' not found")
-
-    if update.enabled is not None:
-        meta.enabled = update.enabled
-        logger.info("Signal '%s' enabled=%s (via Web UI)", name, update.enabled)
-    if update.default_score is not None:
-        meta.default_score = max(0.0, min(100.0, update.default_score))
-    if update.cooldown is not None:
-        meta.cooldown = max(0, update.cooldown)
-
-    return StrategySchema(
-        name=meta.name,
-        description=meta.description,
-        category=meta.category,
-        enabled=meta.enabled,
-        default_score=meta.default_score,
-        cooldown=meta.cooldown,
-        timeframes=meta.timeframes,
-    )
+async def update_strategy(name: str, update: StrategySchema):
+    """Placeholder — V2 strategies not dynamically configurable yet."""
+    logger.info("Strategy update requested via Web UI: %s (not implemented in v0.10.0)", name)
+    return await get_strategy(name)
 
 
 @router.get("/strategies/categories", response_model=dict[str, int])
 async def list_categories():
-    """List signal categories with counts."""
-    metas, _ = _get_registry()
-    cats: dict[str, int] = {}
-    for meta in metas.values():
-        cats[meta.category] = cats.get(meta.category, 0) + 1
-    return cats
+    """List strategy categories with counts."""
+    from strategies import get_strategy_engine
+    engine = get_strategy_engine()
+    return {"v2": len(engine._strategy_by_name)}

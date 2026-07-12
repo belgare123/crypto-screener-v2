@@ -31,30 +31,18 @@ async def health():
 
 @app.get("/signals")
 async def get_signals(limit: int = 20):
-    """Последние N сигналов."""
-    from signals.engine import get_engine
-    engine = get_engine()
-    results = []
-    for _ in range(limit):
-        sig = await engine.get_signal()
-        if sig is None:
-            break
-        results.append({
-            "signal": sig.signal_name,
-            "symbol": sig.symbol,
-            "score": sig.score,
-            "direction": sig.direction,
-            "ts": sig.ts,
-            "meta": sig.meta,
-        })
-    return {"signals": results, "count": len(results)}
+    """Последние N сигналов (из TelegramNotifier)."""
+    from alerts.telegram import get_notifier
+    notifier = get_notifier()
+    recent = getattr(notifier, "_recent_signals", [])
+    return {"signals": recent[-limit:], "count": min(len(recent), limit)}
 
 
 @app.get("/signals/list")
 async def list_signals():
-    """Список зарегистрированных типов сигналов."""
-    from signals import list_signals
-    return {"signals": list_signals()}
+    """Список зарегистрированных стратегий (V2)."""
+    engine = get_strategy_engine()
+    return {"signals": list(engine._strategy_by_name.keys())}
 
 
 @app.get("/pairs")

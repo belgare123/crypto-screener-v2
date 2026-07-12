@@ -16,12 +16,14 @@ def test_core_imports():
 
 
 def test_signals_imports():
-    from signals import BaseSignal, list_signals, register
-    signals = list_signals()
-    assert "volume_spike" in signals
-    assert "whale" in signals
-    assert "smart_money" in signals
-    print(f"✅ signals imports OK ({len(signals)} signals)")
+    """V1 signals module removed in v0.10.0."""
+    pass  # V2 signals flow through core.signal.SignalEngine
+
+
+def test_strategy_imports():
+    from strategies import StrategyEngine
+    assert StrategyEngine is not None
+    print("✅ strategy imports OK")
 
 
 def test_scanner_imports():
@@ -59,6 +61,7 @@ def test_api_imports():
 if __name__ == "__main__":
     test_core_imports()
     test_signals_imports()
+    test_strategy_imports()
     test_scanner_imports()
     test_exchange_imports()
     test_cache_worker()

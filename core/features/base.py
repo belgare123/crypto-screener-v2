@@ -98,6 +98,35 @@ class BaseFeatureCalculator(ABC):
                 self._last_compute[symbol] = time.time()
             return True
 
+    async def compute_batch(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Вычислить признаки для нескольких символов за один проход.
+
+        Дефолтная реализация — последовательный вызов compute().
+        Калькуляторы, поддерживающие векторные операции, переопределяют этот метод.
+
+        Args:
+            symbols: список тикеров
+
+        Returns:
+            dict: {symbol: {name: value, ...}, ...}
+        """
+        import asyncio
+
+        result: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            try:
+                features = await self.compute(symbol)
+                if features:
+                    result[symbol] = features
+                    self._compute_count += 1
+                    self._last_compute[symbol] = time.time()
+            except Exception:
+                logger.exception(
+                    "[feat] calculator '%s' compute_batch error for %s",
+                    self.__class__.__name__, symbol,
+                )
+        return result
+
     async def on_event(self, event: Event):
         """
         Обработать событие с шины.

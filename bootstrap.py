@@ -12,14 +12,15 @@ bootstrap.py — управляемый жизненный цикл Crypto Scree
     2. EXCHANGE — BybitExchange, MarketDataBus
     3. STORAGE — CandleStore, TickerStore, OBStore, TradeStore, LiquidationStore, WhaleTracker
     4. FEATURES — FeatureEngine + 6 calculators
-    5. STATE — StateEngine (regime, trend, volatility)
-    6. CONTEXT — ContextEngine (L3)
-    7. STRATEGY — StrategyEngine (L4) + context_engine
-    8. SIGNALS_V1 — V1 SignalEngine, Dispatcher, V1ContextAdapter
-    9. SERVICES — фоновые тикеры (correlation, heatmap, breadth, rotation, etc.)
-    10. TELEGRAM — TelegramNotifier, handlers, polling
-    11. WARMUP — FeatureEngine warmup (REST)
-    12. RUN — подписка на каналы, ожидание shutdown
+    5. BATCH_UPDATER — BatchFeatureUpdater (background batch refresh)
+    6. STATE — StateEngine (regime, trend, volatility)
+    7. CONTEXT — ContextEngine (L3)
+    8. DECISION — DecisionEngine (adaptive thresholds + SL/TP)
+    9. STRATEGY — StrategyEngine (L4)
+    10. SERVICES — фоновые тикеры (correlation, heatmap, breadth, rotation, etc.)
+    11. TELEGRAM — TelegramNotifier, handlers, polling
+    12. WARMUP — FeatureEngine warmup (REST)
+    13. RUN — подписка на каналы, ожидание shutdown
 """
 
 from __future__ import annotations
@@ -127,6 +128,21 @@ def phase_features(c: Container):
         c.set("feature_engine", None)
 
 
+def phase_batch_updater(c: Container):
+    """Phase 5: BatchFeatureUpdater — background batch refresh of features."""
+    fe = c.get("feature_engine")
+    if fe is None:
+        logger.info("[batch] No FeatureEngine — skipping BatchFeatureUpdater")
+        c.set("batch_updater", None)
+        return
+
+    from core.features.batch_updater import BatchFeatureUpdater
+
+    updater = BatchFeatureUpdater(feature_engine=fe, interval=5.0)
+    c.set("batch_updater", updater)
+    logger.info("[batch] BatchFeatureUpdater created (interval=5.0s)")
+
+
 def phase_state(c: Container):
     """Phase 5: StateEngine."""
     from core.state import get_state_engine
@@ -136,27 +152,52 @@ def phase_state(c: Container):
     c.set("state_engine", se)
 
 
-def phase_context(c: Container):
-    """Phase 6: ContextEngine."""
+async def phase_context(c: Container):
+    """Phase 6: Reactive ContextEngine (L3)."""
     from context import ContextEngine
 
     ce = ContextEngine(
-        feature_engine=c.get("feature_engine"),
-        session_engine=None,  # будет создан в SERVICES
+        feature_store=c.get("feature_store"),
+        session_engine=c.get("session_engine"),
+        bus=c.get("bus"),
+        default_ttl=30.0,
     )
     c.set("context_engine", ce)
-    logger.info("[context] ContextEngine ready")
+    await ce.start()
+    logger.info("[context] ContextEngine ready (TTL=30s)")
+
+
+def phase_decision(c: Container):
+    """Phase 7: DecisionEngine (adaptive thresholds + SL/TP)."""
+    from core.decision import DecisionEngine
+
+    ce = DecisionEngine(
+        context_engine=c.get("context_engine"),
+        consensus_engine=c.get("consensus_engine"),
+        feature_store=c.get("feature_store"),
+        default_threshold=60.0,
+    )
+    if c.get("consensus_engine") is None:
+        logger.info("[decision] no consensus_engine yet — will be set in phase_services")
+    c.set("decision_engine", ce)
+    logger.info("[decision] DecisionEngine ready (shadow=%s)", ce.shadow)
 
 
 def phase_strategy(c: Container):
-    """Phase 7: StrategyEngine + ContextEngine."""
+    """Phase 8: StrategyEngine — sends directly to TelegramNotifier."""
     from context import ContextEngine
     from strategies import StrategyEngine
 
     # Получаем или создаём ContextEngine
     ce = c.get("context_engine")
     if ce is None:
-        ce = ContextEngine(feature_engine=c.get("feature_engine"))
+        from context import ContextEngine
+
+        ce = ContextEngine(
+            feature_store=c.get("feature_store"),
+            bus=c.get("bus"),
+            default_ttl=30.0,
+        )
         c.set("context_engine", ce)
 
     # Импорт стратегий триггерит @register_strategy
@@ -165,45 +206,14 @@ def phase_strategy(c: Container):
     se = StrategyEngine(
         feature_engine=c.get("feature_engine"),
         context_engine=ce,
-        signal_engine=None,  # будет подключён позже через V1 queue
+        notifier=c.get("notifier"),
+        signal_engine=None,  # V1 SignalEngine removed in v0.10.0
     )
     se.register_all()
     logger.info("[strategy] StrategyEngine ready (%d strategies)", len(se._strategies))
+    from strategies import set_strategy_engine as _set_se
+    _set_se(se)
     c.set("strategy_engine", se)
-
-
-def phase_signals_v1(c: Container):
-    """Phase 8: V1 SignalEngine + Dispatcher + V1ContextAdapter."""
-    from signals.engine import SignalEngine
-    from signals.dispatcher import Dispatcher
-    from core.legacy.v1_adapter import V1ContextAdapter
-
-    # V1ContextAdapter — единая точка доступа к данным
-    adapter = V1ContextAdapter(
-        candle_store=c.get("candle_store"),
-        ticker_store=c.get("ticker_store"),
-        ob_store=c.get("ob_store"),
-        whale_tracker=c.get("whale_tracker"),
-        liquidation_store=c.get("liquidation_store"),
-        feature_engine=c.get("feature_engine"),
-        context_engine=c.get("context_engine"),
-    )
-    c.set("v1_adapter", adapter)
-
-    # SignalEngine
-    engine = SignalEngine(
-        bus=c.require("bus"),
-        min_score=40.0,
-    )
-    c.set("signal_engine", engine)
-
-    # Dispatcher (создаётся после notifier)
-    c.set("dispatcher", None)  # placeholder — заполнится после TELEGRAM
-
-    # Recent signals
-    c.set("_recent_signals", [])
-
-    logger.info("[signals_v1] V1 SignalEngine ready")
 
 
 def phase_services(c: Container):
@@ -320,32 +330,36 @@ def phase_services(c: Container):
     # Risk Engine
     from core.risk import get_risk_engine, SpreadRule, ATRRule, LiquidityRule, SessionRule
 
-    risk_engine = get_risk_engine(shadow=True)
+    risk_engine = get_risk_engine(shadow=False)
     risk_engine.add_rule(SpreadRule())
     risk_engine.add_rule(ATRRule())
     risk_engine.add_rule(LiquidityRule())
     risk_engine.add_rule(SessionRule())
     c.set("risk_engine", risk_engine)
+    logger.info("[risk] RiskEngine active (shadow=False)")
 
     # Consensus Engine
     from core.consensus import get_consensus_engine, OpportunityRanking
 
-    consensus_engine = get_consensus_engine(shadow=True)
+    consensus_engine = get_consensus_engine(shadow=False)
     opportunity_rank = OpportunityRanking(window_minutes=10, top_k=3)
     c.set("consensus_engine", consensus_engine)
     c.set("opportunity_rank", opportunity_rank)
+    logger.info("[consensus] ConsensusEngine active (shadow=False)")
 
     # OME
     from core.ome import get_ome
 
-    ome = get_ome(shadow=True, capital=1000.0, risk_pct=0.01)
+    ome = get_ome(shadow=False, capital=1000.0, risk_pct=0.01)
     c.set("ome", ome)
+    logger.info("[ome] OME active (shadow=False)")
 
     # Learning Engine
     from core.learning import get_learning_engine
 
-    learning = get_learning_engine(shadow=True)
+    learning = get_learning_engine(shadow=False)
     c.set("learning_engine", learning)
+    logger.info("[learning] LearningEngine active (shadow=False)")
 
     # Event Bus
     from events import get_event_bus
@@ -357,42 +371,36 @@ def phase_services(c: Container):
 
 
 async def phase_telegram(c: Container):
-    """Phase 10: TelegramNotifier + handlers + Dispatcher."""
+    """Phase 10: TelegramNotifier + handlers + V2 SignalEngine."""
+    from core.signal.engine import SignalEngine as SignalEngineV2
     from alerts.telegram import TelegramNotifier, get_notifier
-    from signals.dispatcher import Dispatcher
     from config import settings
 
     bus = c.require("bus")
-    engine = c.require("signal_engine")
 
+    # V2 SignalEngine — active mode (shadow=False)
+    consensus_engine = c.get("consensus_engine")
+    decision_engine = c.get("decision_engine")
+    risk_engine = c.get("risk_engine")
+    ome = c.get("ome")
+    learning_engine = c.get("learning_engine")
+
+    signal_engine = SignalEngineV2(
+        consensus_engine=consensus_engine,
+        decision_engine=decision_engine,
+        risk_engine=risk_engine,
+        ome=ome,
+        learning_engine=learning_engine,
+        shadow=False,
+    )
+    c.set("signal_engine_v2", signal_engine)
+    logger.info("[signal_v2] SignalEngineV2 active (shadow=False)")
+    
     notifier = TelegramNotifier(
         token=settings.telegram_token,
         chat_id=str(settings.telegram_chat_id),
     )
     c.set("notifier", notifier)
-
-    # Dispatcher (теперь с notifier)
-    dispatcher = Dispatcher(engine=engine, notifier=notifier, min_score=40.0)
-    c.set("dispatcher", dispatcher)
-
-    # Volume Screener + listener
-    from scanner.volume_screener import VolumeScreener
-
-    volume_screener = VolumeScreener(min_turnover=5_000_000)
-
-    async def _volume_listener(ticker_row):
-        msg = (
-            f"🔊 *{ticker_row.display}*\n"
-            f"💰 Объём 24ч: ${ticker_row.turnover_m:.1f}M\n"
-            f"📊 Цена: ${ticker_row.last_price:.4f}  |  Изм: {ticker_row.price_change_24h:+.2f}%"
-        )
-        try:
-            await notifier.send_text(msg)
-        except Exception:
-            logger.exception("[volume_screener] notify error for %s", ticker_row.symbol)
-
-    volume_screener.add_listener(_volume_listener)
-    c.set("volume_screener", volume_screener)
 
     # SignalRecorder + WinRateChecker
     from storage.analytics import WinRateChecker, SignalRecorder, StatsReporter
@@ -420,16 +428,17 @@ async def phase_telegram(c: Container):
     db_path = settings.database_url.replace("sqlite+aiosqlite:///", "")
     settings_db_dir = Path(db_path).parent
     settings_db = UserSettingsDB(settings_db_dir / "user_settings.db")
+    await settings_db.start()
     c.set("settings_db", settings_db)
 
     router = setup_telegram_handlers(settings_db, notifier)
     c.set("telegram_router", router)
     await notifier.attach_router(router)
 
-    # Recent signals listener
-    recent_signals = c.get("_recent_signals", [])
+    # Recent signals via notifier callback (replaces V1 dispatcher listeners)
+    recent_signals: list[dict] = []
 
-    async def _on_signal_listener(sig):
+    async def _on_signal(sig):
         recent_signals.append({
             "symbol": sig.symbol,
             "signal_name": sig.signal_name,
@@ -440,10 +449,10 @@ async def phase_telegram(c: Container):
             recent_signals.pop(0)
         router._recent_signals = recent_signals
 
-    dispatcher.add_listener(_on_signal_listener)
-    dispatcher.add_listener(recorder.on_signal)
+    notifier.register_signal_listener(_on_signal)
+    notifier.register_signal_listener(recorder.on_signal)
 
-    logger.info("[telegram] Telegram layer ready")
+    logger.info("[telegram] Telegram layer ready (v0.10.0 — V2 active)")
 
 
 async def phase_warmup(c: Container):
@@ -517,7 +526,7 @@ async def phase_warmup(c: Container):
 
 
 async def phase_run(c: Container):
-    """Phase 12: Подписка на каналы, запуск тикеров, ожидание shutdown."""
+    """Phase 13: Подписка на каналы, запуск тикеров, ожидание shutdown."""
 
     # ── Подписка на каналы ──
     exchange = c.require("exchange")
@@ -556,19 +565,15 @@ async def phase_run(c: Container):
         await s.start()
     logger.info("[scanner] All scanners started")
 
-    # V1 pipeline
-    engine = c.require("signal_engine")
+    # BatchFeatureUpdater
+    bu = c.get("batch_updater")
+    if bu:
+        await bu.start()
+        logger.info("[batch] BatchFeatureUpdater started (via phase_run)")
+
+    # V2 pipeline — StrategyEngine → notifier (V1 SignalEngine removed in v0.10.0)
     notifier = c.require("notifier")
-    dispatcher = c.require("dispatcher")
-
     await notifier.start()
-    engine.load_signals()
-    await engine.start()
-    await dispatcher.start()
-
-    # Volume screener
-    volume_screener = c.require("volume_screener")
-    await volume_screener.start()
 
     # Strategy Engine
     if strategy_engine:
@@ -612,7 +617,6 @@ async def phase_run(c: Container):
     c.create_task(_lifecycle_ticker(c), name="lifecycle")
     c.create_task(_market_ticker(c), name="market")
     c.create_task(_replay_ticker(c), name="replay")
-    c.create_task(_volume_screener_ticker(c), name="volume_screener")
 
     logger.info("All systems running. Press Ctrl+C to stop.")
 
@@ -652,7 +656,6 @@ async def _health_ticker(c: Container):
     strategy_engine = c.get("strategy_engine")
     session_engine = c.get("session_engine")
     heatmap_engine = c.get("heatmap_engine")
-    engine = c.get("signal_engine")
 
     while True:
         await asyncio.sleep(30)
@@ -663,13 +666,12 @@ async def _health_ticker(c: Container):
             sector_leader = _sector_snap.leading_sector if _sector_snap and _sector_snap.sectors else "?"
 
             logger.info(
-                "[health] signals=%d session=%s rs_top=%s sector=%s feat_cache=%d strategies=%d",
-                len(engine._signals) if engine else 0,
+                "[health] strategies=%d session=%s rs_top=%s sector=%s feat_cache=%d",
+                len(strategy_engine._strategies) if strategy_engine else 0,
                 session_engine.session_name if session_engine else "?",
                 rs_top,
                 sector_leader,
                 feature_engine.store.stats()["alive"] if feature_engine else 0,
-                len(strategy_engine._strategies) if strategy_engine else 0,
             )
 
             b = breadth_engine.last_snapshot
@@ -678,7 +680,7 @@ async def _health_ticker(c: Container):
             if router:
                 router._health_cache = {
                     "uptime": f"{asyncio.get_event_loop().time() - c.loop_start_time:.0f}s",
-                    "signals": len(engine._signals) if engine else 0,
+                    "strategies": len(strategy_engine._strategies) if strategy_engine else 0,
                     "session": session_engine.session_name if session_engine else "?",
                     "rs_top": rs_top,
                     "sector": sector_leader,
@@ -846,11 +848,11 @@ async def _market_ticker(c: Container):
         try:
             corr = c.get("correlation_engine")
             analysis = c.get("analysis_engine")
-            engine = c.get("signal_engine")
+            notifier = c.get("notifier")
             ts = c.get("ticker_store")
             breadth = c.get("breadth_engine")
 
-            if not all([corr, analysis, engine, ts, breadth]):
+            if not all([corr, analysis, notifier, ts, breadth]):
                 continue
 
             prices = {}
@@ -880,7 +882,7 @@ async def _market_ticker(c: Container):
                         if sig.meta is None:
                             sig.meta = {}
                         sig.meta["explanation"] = explanation
-                        await engine.push_signal(sig)
+                        await notifier.send_signal(sig)
         except Exception:
             logger.exception("[market] ticker error")
 
@@ -912,36 +914,6 @@ async def _replay_ticker(c: Container):
             logger.exception("[replay] ticker error")
 
 
-async def _volume_screener_ticker(c: Container):
-    """Volume screener — раз в 300 сек + сводка раз в 30 мин."""
-    vs = c.get("volume_screener")
-    notifier = c.get("notifier")
-    if not vs:
-        return
-
-    cycle = 0
-    while True:
-        try:
-            await vs.run_loop()
-            cycle += 1
-            if cycle % 6 == 0:
-                all_qualifying = vs._known_symbols
-                if all_qualifying and notifier:
-                    tickers = await vs.scan()
-                    if tickers:
-                        top10 = tickers[:10]
-                        lines = ["📊 *Топ объёмов 24ч (Bybit USDT)*\n"]
-                        for i, t in enumerate(top10, 1):
-                            lines.append(
-                                f"{i}. {t.display:15s}  ${t.turnover_m:>7.1f}M  "
-                                f"${t.last_price:>8.4f}  {t.price_change_24h:+.2f}%"
-                            )
-                        lines.append(f"\nВсего {len(tickers)} монет с объёмом ≥ $5M")
-                        await notifier.send_text("\n".join(lines))
-        except Exception:
-            logger.exception("[volume_screener] ticker error")
-
-
 # ══════════════════════════════════════════════
 #  Entry point
 # ══════════════════════════════════════════════
@@ -954,10 +926,11 @@ async def main():
         (Phase.EXCHANGE,       phase_exchange),
         (Phase.STORAGE,        phase_storage),
         (Phase.FEATURES,       phase_features),
+        (Phase.BATCH_UPDATER,  phase_batch_updater),
         (Phase.STATE,          phase_state),
         (Phase.CONTEXT,        phase_context),
+        (Phase.DECISION,       phase_decision),
         (Phase.STRATEGY,       phase_strategy),
-        (Phase.SIGNALS_V1,     phase_signals_v1),
         (Phase.SERVICES,       phase_services),
         (Phase.TELEGRAM,       phase_telegram),
         (Phase.WARMUP,         phase_warmup),

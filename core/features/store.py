@@ -221,6 +221,19 @@ class FeatureStore:
         for symbol, name, value in items:
             await self._notify_observers(symbol, name, value)
 
+    async def get_stale(self, symbol: str, name: str) -> Any | None:
+        """Получить значение фичи, отдавая предпочтение stale.
+
+        Возвращает свежее значение, если есть.
+        Если протухло — возвращает stale значение (не evict).
+        Если никогда не было — возвращает None.
+        """
+        key = _make_key(symbol, name)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        return entry.value
+
     async def get_by_pattern(
         self,
         name_prefix: str,

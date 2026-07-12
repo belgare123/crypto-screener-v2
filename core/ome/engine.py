@@ -32,20 +32,32 @@ class OME:
         self.executor = OrderExecutor(exchange=exchange, shadow=shadow)
 
     def execute_signal(self, symbol: str, side: str, price: float,
-                       atr: float) -> dict:
+                       atr: float,
+                       override_sl: float | None = None,
+                       override_tp: float | None = None) -> dict:
         """Полный pipeline signal → order.
 
         Steps:
-        1. RiskManager → SL/TP
+        1. RiskManager → SL/TP (или override_sl/override_tp если переданы)
         2. PositionSizer → qty
         3. PositionTracker.open(...)
         4. OrderExecutor.execute(...) → Order
+
+        Args:
+            override_sl: динамический SL от DecisionEngine (переопределяет risk_mgr)
+            override_tp: динамический TP от DecisionEngine (переопределяет risk_mgr)
 
         Returns:
             dict {order, position, sizer, risk}
         """
         # 1. SL/TP
         risk = self.risk_mgr.calculate(price, atr, side)
+
+        # DecisionEngine override
+        if override_sl is not None:
+            risk["stop_loss"] = override_sl
+        if override_tp is not None:
+            risk["take_profit"] = override_tp
 
         # 2. Qty
         qty = self.sizer.calculate(self.capital, atr, price, side)

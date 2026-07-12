@@ -1,14 +1,13 @@
 # Crypto Screener v2 — Архитектура и документация
 
-## 0. Ключевые изменения в v0.7.0
+## 0. Ключевые изменения
 
 | Изменение | Файл | Описание |
 |-----------|------|----------|
 | **Phased Bootstrap** | `bootstrap.py` | Замена монолитного `run.py` на Container + фазы. Управляемый жизненный цикл, явные зависимости, graceful shutdown |
-| **DI Container** | `core/di.py` | `Container` — регистрация/resolve компонентов. `Phase` enum (INFRASTRUCTURE → RUN). `run_phase()` с таймингом |
-| **V1 Adapter** | `core/legacy/v1_adapter.py` | Единая точка сборки `SignalContext` для V1 сигналов. Инъекция зависимостей вместо 6 `get_*()` |
+| **DI Container** | `core/di.py` | `Container` — регистрация/resolve компонентов. `Phase` enum. `run_phase()` с таймингом |
+| **V2 Migration (v0.10.0)** | — | V1 SignalEngine, Dispatcher, V1 сигналы удалены. V2 pipeline в active mode |
 | **Data Ownership** | `docs/adr/003-data-ownership.md` | ADR-003: матрица владения данными, SSOT, поток данных |
-| **Legacy** | `core/legacy/__init__.py` | Модуль обратной совместимости V1 → V2 |
 
 **Entry point:** `python bootstrap.py` (новый, рекомендуемый) или `python run.py` (старый, совместимость).
 
@@ -44,36 +43,50 @@
 └────┬─────┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘
      │            │              │              │
      ▼            ▼              ▼              ▼
-┌───────────────────────────────────────────────────────────┐
-│  SignalEngine (signals/engine.py)                          │
-│  • Собирает контекст: свечи, тикеры, стакан, киты, CVD    │
-│  • Гоняет все загруженные сигналы через check(context)     │
-│  • Min‑score фильтр + антиспам (30 min cooldown)          │
-│  • Публикует SignalResult в очередь                        │
-└────────────────────┬──────────────────────────────────────┘
-                     │ SignalResult
-                     ▼
-┌───────────────────────────────────────────────────────────┐
-│  Dispatcher (signals/dispatcher.py)                       │
-│  • Раз в 2 сек собирает сигналы в батч (до 10)            │
-│  • Anti‑spam + дедупликация                               │
-│  • Приоритизация (score 40‑60 / 60‑80 / 80‑95 / 95‑100)  │
-│  • Оповещает слушателей (SignalRecorder + stats)          │
-│  • Отправляет в Telegram                                  │
-└──────────┬────────────────────────────────────────────────┘
-           │
-    ┌──────┴──────┐
-    ▼              ▼
-┌────────┐  ┌──────────────┐
-│Telegram│  │ SignalRecor. │
-│Бот     │  │ (SQLite)     │
-│@ecrv3  │  └──────┬───────┘
-│_bot    │         ▼
-└────────┘  ┌──────────────┐
-            │ WinRateCheck │
-            │ (5 min оценка│
-            │  win/loss)   │
-            └──────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  FeatureEngine (core/features/engine.py)                            │
+│  • 6+ calculators: whale, ohlcv, indicators, orderbook, market,    │
+│    volatility                                                      │
+│  • BATCH_UPDATER — pull-модель (каждые 5s) для всех пар            │
+│  • stale-while-revalidate через get_stale() + peek()               │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │ context dict
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  ContextEngine (context/engine.py)                                  │
+│  • Реактивное обогащение контекста                                  │
+│  • Lazy fetch через get_feature() + get_metric()                   │
+│  • Ручной TTL на каждый ключ                                       │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │ StrategyContext
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  StrategyEngine (strategies/__init__.py)                            │
+│  • 5+ V2 стратегий (Momentum, Whale, RS, SMA, OB)                  │
+│  • @register_strategy декоратор                                    │
+│  • Cooldown per strategy (30–300s)                                  │
+│  • Отправляет SignalResult напрямую в TelegramNotifier             │
+└──────────┬──────────────────────────────────────────────────────────┘
+           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TelegramNotifier — send_signal(sig)                                │
+│  • Notify слушателей (SignalRecorder, метрики)                     │
+│  • Retry/backoff при ошибках сети                                   │
+│  • Сохраняет recent_signals для API                                 │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                    ┌──────┴──────┐
+                    ▼              ▼
+               ┌────────┐  ┌──────────────┐
+               │Telegram│  │ SignalRecor. │
+               │Бот     │  │ (SQLite)     │
+               │@ecrv3  │  └──────┬───────┘
+               │_bot    │         ▼
+               └────────┘  ┌──────────────┐
+                          │ WinRateCheck │
+                          │ (5 min оценка│
+                          │  win/loss)   │
+                          └──────────────┘
 ```
 
 ## 2. Структура директорий
@@ -113,32 +126,14 @@ crypto-screener-v2/
 │   ├── ticker.py               # TickerScanner + TickerStore (partial update) + LiquidationStore
 │   └── orderbook.py            # OrderBookScanner
 │
-├── signals/                    # Все сигналы (плагинная архитектура)
-│   ├── __init__.py             # Регистратор (@register, list_signals)
-│   ├── base.py                 # BaseSignal, SignalContext, SignalMeta
-│   ├── engine.py               # SignalEngine (движок)
-│   ├── dispatcher.py           # Dispatcher (батчинг + отправка)
-│   │
-│   ├── volume.py               # Volume‑сигналы (z‑score, spike, surge)
-│   ├── whale.py                # Whale‑сигналы (крупные сделки, CVD)
-│   ├── smart_money.py          # Smart Money (асимметрия, скопление)
-│   ├── trade_flow.py           # Trade Flow (buy/sell ratio, aggression)
-│   │
-│   ├── candle_technicals.py    # RSI, momentum, body, consecutive
-│   ├── candle_patterns.py      # Свечные паттерны (doji, hammer, engulfing, etc.)
-│   │
-│   ├── orderbook_signal.py     # Orderbook (баланс стен, спред, глубина)
-│   ├── orderbook_signals.py    # Доп. OB сигналы (ratchet, wall, liquidity cluster)
-│   │
-│   ├── liquidation_signal.py   # Ликвидации (кластеры, каскады, объём)
-│   ├── liquidation_advanced.py # Продвинутые ликвидационные сигналы
-│   │
-│   ├── hybrid.py               # Мульти‑факторные (объём + свечи + OB)
-│   ├── ai_score.py             # AI Score (6 факторов + MTF confluence)
-│   │
-│   ├── correlation.py          # Сигналы Correlation Engine
-│   ├── relative_strength.py    # RS‑сигналы (momentum, ranking)
-│   └── sector.py               # Секторные сигналы (rotation, strength)
+├── strategies/                  # V2 стратегии (заменили signals/ в v0.10.0)
+│   ├── __init__.py              # StrategyEngine + @register_strategy
+│   ├── base.py                  # BaseStrategy, StrategyContext, StrategyMeta
+│   ├── momentum_v2.py           # V2 Momentum (+RS, SMA, Whale, OB, AI)
+│   └── ...                      # Другие V2 стратегии
+│
+├── core/signal/                 # V2 SignalEngine (central dispatch)
+│   └── engine.py                # SignalEngine — shadow=False (active since v0.10.0)
 │
 ├── alerts/                     # Оповещения
 │   ├── telegram.py             # TelegramNotifier (aiogram + SOCKS5)
@@ -196,61 +191,21 @@ crypto-screener-v2/
 
 Все данные пишутся в `core/storage/` (синглтоны). Старые scanner-буферы (`CandleBuffer`, `TickerStore` из scanner) получают данные параллельно (Strangler Fig) и будут удалены в v0.6.0.
 
-#### 3.3 SignalEngine
-Under `SignalEngine._on_event`:
-1. Фильтр — только события `candles.*` и `trades.*`
-2. Сбор контекста `_build_context(symbol)` (через **core.storage**):
-   - `get_candle_store().get_sync(symbol, "1", 60)` — 60 свечей 1m
-   - `get_candle_store().get_sync(symbol, "5", 30)` — 30 свечей 5m
-   - `get_candle_store().get_sync(symbol, "15", 30)` — 30 свечей 15m
-   - `get_ticker_store().get_sync(symbol)` — текущий тикер
-   - `get_ob_store().get_sync(symbol)` — стакан
-   - `get_whale_tracker().get_whales(symbol, 100k)` — киты
-   - `get_whale_tracker().get_cvd(symbol)` — CVD
-   - `get_liquidation_store().recent(5m)` — последние ликвидации
-3. `VolatilityTracker.update()` — ATR для Adaptive Thresholds
-4. Прогон всех загруженных сигналов через `signal.check(ctx)`
+#### 3.3 V2 Pipeline (v0.10.0)
 
-#### 3.4 Сигналы
-Каждый сигнал — наследник `BaseSignal` с декоратором `@register(name, category, default_score, cooldown)`:
-```python
-@register("rs_momentum", category="relative_strength", default_score=60, cooldown=1800)
-class RSMomentum(BaseSignal):
-    async def check(self, ctx) -> SignalResult | None:
-        # логика → return SignalResult(...) или None
-```
+Сигналы проходят через три последовательных слоя:
 
-Всего **35 сигналов**, разделённых на категории:
+1. **FeatureEngine** (`core/features/engine.py`) — pull-модель, каждые 5 секунд BATCH_UPDATER обновляет признаки всех пар. Stale-while-revalidate: `get_stale()` → `peek()` → `compute_batch()`.
+2. **StrategyEngine** (`strategies/__init__.py`) — @register_strategy декоратор. Cooldown per strategy (30–300s). Результат → `SignalResult` → напрямую в `TelegramNotifier.send_signal()`.
+3. **TelegramNotifier** (`alerts/telegram.py`) — форматирование + Telegram API (aiogram + SOCKS5). Notify слушателей (SignalRecorder → SQLite, метрики). Retry/backoff при ошибках.
 
-| Категория | Сигналы | Кол-во |
-|-----------|---------|--------|
-| **volume** | volume_z, volume_spike, volume_surge, consecutive_volume | 4 |
-| **whale** | whale, cvd_spike, smart_money, whale_wall | 4 |
-| **candle** | rsi, momentum, body, consecutive, pattern (doji/hammer/engulfing/etc) | ~8 |
-| **orderbook** | orderbook_imbalance, wall, spread, ladder, ratchet, liquidity_cluster | ~6 |
-| **liquidation** | liq_cluster, liq_cascade, liq_volume | 3 |
-| **trade_flow** | buy_sell_ratio, aggression | 2 |
-| **hybrid** | volume_candle, whale_orderbook | 2 |
-| **ai_score** | ai_score (6‑factor confluence) | 1 |
-| **correlation** | market_leader, divergence, market_alignment | 3 |
-| **relative_strength** | rs_momentum, rs_ranking | 2 |
-| **sector** | sector_rotation, sector_strength | 2 |
+Подробнее: `bootstrap.py` (фазы STRATEGY, SERVICES, TELEGRAM, RUN).
 
-#### 3.5 Anti‑spam
-Три уровня фильтрации:
-1. `engine._min_score` (default 60) — сигнал с score < 60 отбрасывается
-2. `SignalCooldown` — каждый сигнал имеет cooldown 1800s (30 мин). Если сигнал уже был отослан, повтор не пройдёт. + **Degrade**: если новый score ниже предыдущего — не шлём
-3. `Dispatcher` — батчинг (2 сек, макс 10 сигналов) + дедупликация внутри батча
+#### 3.4 Anti‑spam (V2)
 
-#### 3.6 Отправка
-Dispatcher:
-- Собирает сигналы 2 секунды
-- Отправляет 1 сигнал → `notifier.send_signal(sig)`, пачка → `notifier.send_batch(batch)`
-- Оповещает слушателей (SignalRecorder → SQLite)
-
-TelegramNotifier:
-- Форматирует сигнал в Markdown
-- Отправляет через Telegram API (aiogram + SOCKS5 127.0.0.1:10808)
+- Cooldown per strategy (устанавливается в @register_strategy, 30–300s)
+- Risk Engine `shadow=False` — пре-трейд фильтрация (SpreadRule, ATRRule, LiquidRule)
+- `TelegramNotifier.send_signal()` — проверка на дубликаты через `_recent_signals` (LIFO, 20 шт)
 
 ## 4. Core Engines (Tier 1)
 
@@ -425,15 +380,14 @@ aiogram 3.29+ использует `AiohttpSession(proxy="socks5://127.0.0.1:108
 - Импорты протестированы, 164 теста проходят
 
 **Осталось:**
-- Удалить `scanner/volume_screener.py` (чужеродный модуль, P2)
-- Полностью удалить `scanner/` когда все компоненты (V1 SignalEngine → V2 Pipeline) переедут в core/
+- [x] Удалить `scanner/volume_screener.py` (чужеродный модуль, P2) ✅
+- [ ] Полностью удалить `scanner/` когда все компоненты переедут в core/
 
-### 2. Модуль `signals/` (V1 legacy)
+### 2. Модуль `signals/` (V1 legacy) — ВЫПОЛНЕНО (v0.10.0)
 
-**Статус:** 🟡 Частично замещён V2 pipeline  
-**ADR:** [ADR-001: Отказ от scanner](docs/adr/001-scanner-deprecation.md)
+**Статус:** ✅ Удалён
 
-V1-сигналы (`signals/engine.py`, `signals/dispatcher.py`) дублируют вычисления `core/features/calculators/`. После полной миграции всех стратегий на V2 pipeline (FeatureEngine + StateEngine + Consensus + OME) модуль `signals/` будет удалён.
+V1 SignalEngine, Dispatcher и 35 V1 сигналов полностью удалены из кодовой базы. V2 pipeline (FeatureEngine → StrategyEngine → TelegramNotifier) работает в active mode.
 
 ### 3. Глобальные признаки (GlobalFeatureService)
 

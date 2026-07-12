@@ -8,10 +8,11 @@ Container хранит все компоненты приложения в од�
   Phase.INFRASTRUCTURE — логирование, сигналы ОС
   Phase.STORAGE       — CandleStore, TickerStore, OBStore, etc.
   Phase.FEATURES      — FeatureEngine, FeatureStore, calculators
+  Phase.BATCH_UPDATER — BatchFeatureUpdater (background batch refresh)
   Phase.STATE         — StateEngine, regime/trend/volatility
   Phase.CONTEXT       — ContextEngine (L3)
+  Phase.DECISION      — DecisionEngine (adaptive thresholds + SL/TP)
   Phase.STRATEGY      — StrategyEngine (L4)
-  Phase.SIGNALS_V1    — V1 SignalEngine, Dispatcher (legacy)
   Phase.SERVICES      — фоновые тикеры (heatmap, correlation, breadth, etc.)
   Phase.TELEGRAM      — TelegramNotifier, handlers
   Phase.WARMUP        — FeatureEngine warmup (REST)
@@ -36,10 +37,11 @@ class Phase(Enum):
     INFRASTRUCTURE = auto()
     STORAGE = auto()
     FEATURES = auto()
+    BATCH_UPDATER = auto()
     STATE = auto()
     CONTEXT = auto()
+    DECISION = auto()
     STRATEGY = auto()
-    SIGNALS_V1 = auto()
     SERVICES = auto()
     TELEGRAM = auto()
     WARMUP = auto()
@@ -128,12 +130,33 @@ class Container:
         await self.cancel_all_tasks()
 
         # Останавливаем компоненты в обратном порядке
+        batch_updater = self.get("batch_updater")
+        if batch_updater and hasattr(batch_updater, "stop"):
+            try:
+                await batch_updater.stop()
+            except Exception:
+                logger.exception("[shutdown] batch_updater stop error")
+
+        context_engine = self.get("context_engine")
+        if context_engine and hasattr(context_engine, "stop"):
+            try:
+                await context_engine.stop()
+            except Exception:
+                logger.exception("[shutdown] context_engine stop error")
+
         notifier = self.get("notifier")
         if notifier and hasattr(notifier, "stop"):
             try:
                 await notifier.stop()
             except Exception:
                 logger.exception("[shutdown] notifier stop error")
+
+        settings_db = self.get("settings_db")
+        if settings_db and hasattr(settings_db, "close"):
+            try:
+                await settings_db.close()
+            except Exception:
+                logger.exception("[shutdown] settings_db close error")
 
         exchange = self.get("exchange")
         if exchange and hasattr(exchange, "stop"):
