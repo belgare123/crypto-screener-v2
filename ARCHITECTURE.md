@@ -1,5 +1,17 @@
 # Crypto Screener v2 — Архитектура и документация
 
+## 0. Ключевые изменения в v0.7.0
+
+| Изменение | Файл | Описание |
+|-----------|------|----------|
+| **Phased Bootstrap** | `bootstrap.py` | Замена монолитного `run.py` на Container + фазы. Управляемый жизненный цикл, явные зависимости, graceful shutdown |
+| **DI Container** | `core/di.py` | `Container` — регистрация/resolve компонентов. `Phase` enum (INFRASTRUCTURE → RUN). `run_phase()` с таймингом |
+| **V1 Adapter** | `core/legacy/v1_adapter.py` | Единая точка сборки `SignalContext` для V1 сигналов. Инъекция зависимостей вместо 6 `get_*()` |
+| **Data Ownership** | `docs/adr/003-data-ownership.md` | ADR-003: матрица владения данными, SSOT, поток данных |
+| **Legacy** | `core/legacy/__init__.py` | Модуль обратной совместимости V1 → V2 |
+
+**Entry point:** `python bootstrap.py` (новый, рекомендуемый) или `python run.py` (старый, совместимость).
+
 ## 1. Общая архитектура
 
 ```
@@ -400,18 +412,20 @@ aiogram 3.29+ использует `AiohttpSession(proxy="socks5://127.0.0.1:108
 
 ### 1. Модуль `scanner/` (legacy)
 
-**Статус:** ✅ Мигрирован в `core/storage/` (v0.5.0) — Strangler Fig активен  
+**Статус:** ✅ Полностью мигрирован в `core/storage/`. Legacy stores удалены (v0.7.0).
+
+`scanner/` теперь содержит только WS-обработчики (Scanners), которые пишут напрямую в `core/storage/`. Это полностью очищенный слой WebSocket-подписок без двойной записи.
+
 **ADR:** [ADR-001: Отказ от scanner](docs/adr/001-scanner-deprecation.md)
 
-Ранее `scanner/` служил временным слоем буферизации данных. Начиная с v0.5.0 все потребители (`run.py`, `api/__init__.py`, `signals/engine.py`, `smoke_test.py`) читают данные из `core/storage/`.
-
-**Что сделано:**
-- Созданы `CandleStore`, `TickerStore`, `OBStore`, `TradeStore`, `LiquidationStore`, `WhaleTracker` в `core/storage/`
-- Все потребители мигрированы на core.storage (sync/async dual‑mode)
-- Strangler Fig: данные пишутся и в старые scanner-буферы, и в core.storage параллельно
+**Что сделано (v0.7.0):**
+- Удалены legacy stores: CandleBuffer, TickerStore, LiquidationStore, WhaleTracker, `orderbooks` dict
+- Удалены все Strangler Fig дублирующие записи в scanner/файлах
+- Все Scanner-классы пишут исключительно в `core/storage/`
+- Импорты протестированы, 164 теста проходят
 
 **Осталось:**
-- Удалить финальные ссылки на scanner stores (дождаться отключения старых буферов)
+- Удалить `scanner/volume_screener.py` (чужеродный модуль, P2)
 - Полностью удалить `scanner/` когда все компоненты (V1 SignalEngine → V2 Pipeline) переедут в core/
 
 ### 2. Модуль `signals/` (V1 legacy)
