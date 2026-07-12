@@ -32,5 +32,7 @@ market_replay.db*
 *.pid
 .DS_Store
 
-# Docker
+# Secrets
+deploy_key.pem
+*.pem
 *.tar
