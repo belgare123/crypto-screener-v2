@@ -7,6 +7,7 @@ import time
 from collections import defaultdict, deque
 
 from core import Event, get_bus
+from core.storage import get_candle_store
 from scanner import BaseScanner
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,8 @@ class CandleScanner(BaseScanner):
                 "quote_volume": float(candle.get("qv", candle.get("quote_volume", 0))),
             }
         try:
-            candle_buffer.update(event.symbol, tf, candle)
+            # Strangler Fig: пишем в оба хранилища
+            candle_buffer.update(event.symbol, tf, candle)          # legacy
+            await get_candle_store().put_candle(event.symbol, tf, candle)  # core.storage
         except Exception:
             logger.exception("candle update failed for %s", event.symbol)

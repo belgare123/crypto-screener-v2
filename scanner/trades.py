@@ -104,3 +104,6 @@ class TradeScanner(BaseScanner):
                 "type": trade.get("type", "market"),
             }
             whale_tracker.add_trade(event.symbol, normalized)
+            # Strangler Fig — core.storage
+            from core.storage import get_whale_tracker
+            get_whale_tracker().add_trade(event.symbol, normalized)

@@ -60,15 +60,15 @@ async def list_signals():
 @app.get("/pairs")
 async def get_pairs():
     """Активные пары."""
-    from scanner.ticker import ticker_store
-    return {"pairs": list(ticker_store.all.keys())}
+    from core.storage import get_ticker_store
+    return {"pairs": list(get_ticker_store().all_sync().keys())}
 
 
 @app.get("/whales/{symbol}")
 async def get_whales(symbol: str):
     """Whale сделки для символа."""
-    from scanner.trades import whale_tracker
-    whales = whale_tracker.get_whales(symbol)
+    from core.storage import get_whale_tracker
+    whales = get_whale_tracker().get_whales(symbol)
     return {"symbol": symbol, "whales": whales[-20:]}
 
 

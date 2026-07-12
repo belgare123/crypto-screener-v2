@@ -80,7 +80,15 @@ crypto-screener-v2/
 │   ├── sector_scanner.py       # Sector Scanner (6 секторов)
 │   ├── cache.py                # Кеш
 │   ├── scheduler.py            # Планировщик
-│   └── worker.py               # Воркер пул
+│   ├── worker.py               # Воркер пул
+│   └── storage/                # Единый слой данных (v2, заменил scanner/*)
+│       ├── candle_store.py     # CandleStore — MTF свечи
+│       ├── ticker_store.py     # TickerStore — последние тикеры
+│       ├── ob_store.py         # OBStore — стаканы + OrderBookState
+│       ├── trade_store.py      # TradeStore — трейды
+│       ├── liquidation_store.py # LiquidationStore — ликвидации
+│       ├── whale_tracker.py    # WhaleTracker — киты + CVD
+│       └── feature_store.py    # FeatureStore — кэш признаков
 │
 ├── exchanges/                  # Адаптеры бирж
 │   ├── bybit/__init__.py       # Bybit WS (sub/unsub/listen/reconnect)
@@ -167,25 +175,27 @@ crypto-screener-v2/
 Каждое сообщение превращается в `Event(channel, symbol, data, ts)` и публикуется в `MarketDataBus`.
 
 #### 3.2 Сканеры
-Каждый сканер подписан на свой канал шины:
-- **CandleScanner** → `candles.{symbol}` — обновляет `CandleBuffer` (MTF: 1m, 5m, 15m)
-- **TradeScanner** → `trades.{symbol}` — обновляет `WhaleTracker` (крупные сделки + CVD)
+Каждый сканер подписан на свой канал шины и пишет данные в **два хранилища** (Strangler Fig):
+- **CandleScanner** → `candles.{symbol}` — обновляет `CandleStore` (MTF: 1m, 5m, 15m)
+- **TradeScanner** → `trades.{symbol}` — обновляет `TradeStore` + `WhaleTracker` (крупные сделки + CVD)
 - **TickerScanner** → `ticker.{symbol}` — обновляет `TickerStore` (last_price, volume, изменения)
-- **OrderBookScanner** → `orderbook.{symbol}` — обновляет `OrderBookState` (bid/ask, стены, спред)
+- **OrderBookScanner** → `orderbook.{symbol}` — обновляет `OBStore` (bid/ask, стены, спред)
 - **LiquidationScanner** → `liquidation.{symbol}` — обновляет `LiquidationStore` (кластеры)
+
+Все данные пишутся в `core/storage/` (синглтоны). Старые scanner-буферы (`CandleBuffer`, `TickerStore` из scanner) получают данные параллельно (Strangler Fig) и будут удалены в v0.6.0.
 
 #### 3.3 SignalEngine
 Under `SignalEngine._on_event`:
 1. Фильтр — только события `candles.*` и `trades.*`
-2. Сбор контекста `_build_context(symbol)`:
-   - `candle_buffer.get(symbol, "1", 60)` — 60 свечей 1m
-   - `candle_buffer.get(symbol, "5", 30)` — 30 свечей 5m
-   - `candle_buffer.get(symbol, "15", 30)` — 30 свечей 15m
-   - `ticker_store.get(symbol)` — текущий тикер
-   - `orderbooks.get(symbol)` — стакан
-   - `whale_tracker.get_whales(symbol, 100k)` — киты
-   - `whale_tracker.get_cvd(symbol)` — CVD
-   - `liquidation_store.recent(5m)` — последние ликвидации
+2. Сбор контекста `_build_context(symbol)` (через **core.storage**):
+   - `get_candle_store().get_sync(symbol, "1", 60)` — 60 свечей 1m
+   - `get_candle_store().get_sync(symbol, "5", 30)` — 30 свечей 5m
+   - `get_candle_store().get_sync(symbol, "15", 30)` — 30 свечей 15m
+   - `get_ticker_store().get_sync(symbol)` — текущий тикер
+   - `get_ob_store().get_sync(symbol)` — стакан
+   - `get_whale_tracker().get_whales(symbol, 100k)` — киты
+   - `get_whale_tracker().get_cvd(symbol)` — CVD
+   - `get_liquidation_store().recent(5m)` — последние ликвидации
 3. `VolatilityTracker.update()` — ATR для Adaptive Thresholds
 4. Прогон всех загруженных сигналов через `signal.check(ctx)`
 
@@ -390,17 +400,19 @@ aiogram 3.29+ использует `AiohttpSession(proxy="socks5://127.0.0.1:108
 
 ### 1. Модуль `scanner/` (legacy)
 
-**Статус:** ⏳ Плановая замена в v0.6.0  
+**Статус:** ✅ Мигрирован в `core/storage/` (v0.5.0) — Strangler Fig активен  
 **ADR:** [ADR-001: Отказ от scanner](docs/adr/001-scanner-deprecation.md)
 
-`scanner/` является временным слоем буферизации данных, который должен быть заменён на `core/storage/`. На момент v0.5.0 scanner используется в:
+Ранее `scanner/` служил временным слоем буферизации данных. Начиная с v0.5.0 все потребители (`run.py`, `api/__init__.py`, `signals/engine.py`, `smoke_test.py`) читают данные из `core/storage/`.
 
-- `run.py` — инициализация CandleBuffer, TickerStore, OrderBookState, TradeScanner и др.
-- `signals/engine.py` — data source для V1 SignalEngine (candle_buffer, ticker_store, orderbooks).
-- `api/__init__.py` — эндпоинты `/pairs` и `/whales/{symbol}`.
-- `smoke_test.py` и `tests/test_imports.py` — интеграционные тесты.
+**Что сделано:**
+- Созданы `CandleStore`, `TickerStore`, `OBStore`, `TradeStore`, `LiquidationStore`, `WhaleTracker` в `core/storage/`
+- Все потребители мигрированы на core.storage (sync/async dual‑mode)
+- Strangler Fig: данные пишутся и в старые scanner-буферы, и в core.storage параллельно
 
-**План миграции:** создать `core/storage/` с CandleStore, TickerStore, OBStore, TradeStore; мигрировать потребителей; удалить `scanner/`.
+**Осталось:**
+- Удалить финальные ссылки на scanner stores (дождаться отключения старых буферов)
+- Полностью удалить `scanner/` когда все компоненты (V1 SignalEngine → V2 Pipeline) переедут в core/
 
 ### 2. Модуль `signals/` (V1 legacy)
 

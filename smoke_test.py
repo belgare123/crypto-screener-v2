@@ -79,10 +79,11 @@ async def smoke_test():
     from core.monitoring.health import get_healthcheck, HealthComponent, HealthStatus
 
     from exchanges.bybit import BybitExchange
-    from scanner.ticker import TickerScanner, LiquidationScanner, ticker_store, liquidation_store
-    from scanner.candles import CandleScanner, candle_buffer
-    from scanner.trades import TradeScanner, whale_tracker
+    from scanner.ticker import TickerScanner, LiquidationScanner
+    from scanner.candles import CandleScanner
+    from scanner.trades import TradeScanner
     from scanner.orderbook import OrderBookScanner
+    from core.storage import get_candle_store, get_ticker_store, get_ob_store, get_liquidation_store, get_whale_tracker
     from core.features.engine import FeatureEngine, get_feature_engine
     from core.features.calculators.whale import WhaleFeatureCalculator
     from core.features.calculators.ohlcv import OHLCVFeatureCalculator
@@ -185,15 +186,15 @@ async def smoke_test():
         status, body = await check_http("/health")
         h_msg = body[:120].replace("\n", " ")[:80] if status == 200 else f"ERR({status})"
 
-        tk = ticker_store.get(SYMBOL)
+        tk = get_ticker_store().get_sync(SYMBOL)
         price = tk["last_price"] if tk else "—"
         vol = tk["volume_24h"] if tk else "—"
 
-        candles = candle_buffer.get(SYMBOL, "1", count=3)
+        candles = get_candle_store().get_sync(SYMBOL, "1", 3)
         candle_count = len(candles)
 
-        whales = whale_tracker.get_whales(SYMBOL)
-        liqs = liquidation_store.total_volume(minutes=30)
+        whales = get_whale_tracker().get_whales(SYMBOL)
+        liqs = get_liquidation_store().total_volume(minutes=30)
         feats = fe.stats["features"]
 
         logger.info(
@@ -219,7 +220,7 @@ async def smoke_test():
         logger.info("Health (raw): %s", body[:200])
 
     # Ticker
-    tk = ticker_store.get(SYMBOL)
+    tk = get_ticker_store().get_sync(SYMBOL)
     if tk:
         logger.info("Ticker[%s]: price=%.2f vol24h=%.0f change=%.4f%%",
                      SYMBOL, tk["last_price"], tk["volume_24h"], tk["change_24h"] * 100)
@@ -227,13 +228,13 @@ async def smoke_test():
         logger.error("TickerStore[%s]: NO DATA", SYMBOL)
 
     # Candles
-    c = candle_buffer.get(SYMBOL, "1")
+    c = get_candle_store().get_sync(SYMBOL, "1")
     logger.info("Candles[%s, 1m]: %d candles", SYMBOL, len(c))
 
     # Whales / Trades
-    whales = whale_tracker.get_whales(SYMBOL)
-    cvd = whale_tracker.get_cvd(SYMBOL)
-    liq_vol = liquidation_store.total_volume(minutes=60)
+    whales = get_whale_tracker().get_whales(SYMBOL)
+    cvd = get_whale_tracker().get_cvd(SYMBOL)
+    liq_vol = get_liquidation_store().total_volume(minutes=60)
     logger.info("Trades: %d whales tracked, CVD=%.0f, LiqVol(1h)=%.0f",
                  len(whales), cvd, liq_vol)
 

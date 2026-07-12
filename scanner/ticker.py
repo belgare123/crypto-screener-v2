@@ -7,6 +7,7 @@ import time
 from collections import defaultdict
 
 from core import Event, get_bus
+from core.storage import get_ticker_store
 from scanner import BaseScanner
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,16 @@ class TickerScanner(BaseScanner):
 
     async def process(self, event: Event):
         ticker_store.update(event.symbol, event.data)
+        # Strangler Fig — core.storage
+        mapped = {
+            "last_price": event.data.get("lastPrice", 0),
+            "volume_24h": event.data.get("volume24h", 0),
+            "turnover_24h": event.data.get("turnover24h", event.data.get("quoteVolume", 0)),
+            "change_24h": event.data.get("price24hPcnt", 0),
+            "high_24h": event.data.get("highPrice24h", 0),
+            "low_24h": event.data.get("lowPrice24h", 0),
+        }
+        await get_ticker_store().put(event.symbol, mapped)
 
 
 # ──────────────────────────────────────────────
@@ -116,3 +127,6 @@ class LiquidationScanner(BaseScanner):
             if not isinstance(liq, dict):
                 continue
             liquidation_store.add(event.symbol, event.exchange, liq)
+            # Strangler Fig — core.storage
+            from core.storage import get_liquidation_store
+            get_liquidation_store().add(event.symbol, event.exchange, liq)

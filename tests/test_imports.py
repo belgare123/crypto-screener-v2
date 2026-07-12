@@ -25,10 +25,11 @@ def test_signals_imports():
 
 
 def test_scanner_imports():
-    from scanner.candles import candle_buffer, CandleScanner
-    from scanner.trades import whale_tracker, TradeScanner
-    from scanner.orderbook import orderbooks, OrderBookScanner
-    from scanner.ticker import ticker_store, liquidation_store
+    from scanner.candles import CandleScanner
+    from scanner.trades import TradeScanner
+    from scanner.orderbook import OrderBookScanner
+    from scanner.ticker import TickerScanner, LiquidationScanner
+    from core.storage import get_candle_store, get_ticker_store, get_ob_store, get_liquidation_store, get_whale_tracker
     print("✅ scanner imports OK")
 
 

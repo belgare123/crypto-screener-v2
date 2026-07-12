@@ -6,7 +6,7 @@ import signal
 import sys
 import time
 
-from scanner.orderbook import OrderBookScanner, orderbooks
+from scanner.orderbook import OrderBookScanner
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +73,11 @@ async def main():
     bus = get_bus()
 
     # ── 3. Data Streams ──
-    from scanner.candles import CandleBuffer
-    from scanner.ticker import TickerStore
-    from scanner.orderbook import OrderBookState as _OBS, orderbooks
+    from core.storage import get_candle_store, get_ticker_store, get_ob_store
 
-    candle_buffer = CandleBuffer(maxlen=200)
-    ticker_store = TickerStore()
+    candle_store = get_candle_store()
+    ticker_store = get_ticker_store()
+    ob_store = get_ob_store()
 
     # ── 4. Scanners ──
     from scanner.trades import TradeScanner
@@ -103,7 +102,7 @@ async def main():
     from core.rotation import RotationDetector
     from core.relative_strength import RelativeStrengthEngine
 
-    rs_engine = RelativeStrengthEngine(candle_buffer)
+    rs_engine = RelativeStrengthEngine(candle_store)
 
     # ── 7. Sector Scanner (нужен RotationDetector'у) ──
     from core.sector_scanner import SectorScannerEngine as SectorEngine
@@ -116,7 +115,7 @@ async def main():
     from core.heatmap import HeatmapEngine
 
     def _ticker_all_getter():
-        return dict(ticker_store.all()) if hasattr(ticker_store, 'all') and callable(ticker_store.all) else {}
+        return ticker_store.all_sync()
 
     async def _liq_getter(minutes=5):
         return []
@@ -127,10 +126,10 @@ async def main():
     from core.liquidity_zones import LiquidityZoneEngine
 
     def _candle_getter(symbol: str, tf: str = "5m", limit: int = 100):
-        return candle_buffer.get(symbol, tf, limit) if hasattr(candle_buffer, 'get') else []
+        return candle_store.get_sync(symbol, tf, limit)
 
     def _ob_getter(symbol: str):
-        return orderbooks.get(symbol)
+        return ob_store.get_sync(symbol)
 
     liquidity_engine = LiquidityZoneEngine(candle_getter=_candle_getter, ob_getter=_ob_getter)
 
@@ -316,7 +315,7 @@ async def main():
     # ── 16. Pattern Similarity ──
     pattern_sim = PatternSimilarityEngine(dna_store)
 
-    # ── 17. Data integration for tickers — read candle_buffer ──
+    # ── 17. Data integration for tickers — read CandleStore ──
     # ticker_getter, чтобы можно было узнавать текущую цену из любого места
 
     async def _get_price(symbol: str) -> float | None:
@@ -699,7 +698,7 @@ async def main():
                     current_price = float(t.get("lastPrice", t.get("last_price", 0))) if t else 0
                     if current_price <= 0:
                         continue
-                    snap = analysis_engine.analyze(sym, current_price, prices, candle_buffer)
+                    snap = analysis_engine.analyze(sym, current_price, prices, candle_store)
                     if snap:
                         sig = analysis_engine.to_signal(sym, current_price, prices, correlation_snapshot, noise_level)
                         if sig:
@@ -734,7 +733,7 @@ async def main():
                 # Сохраняем снэпшоты для BTC & ETH (есть orderbook)
                 for sym in ("BTC/USDT:USDT", "ETH/USDT:USDT"):
                     ticker = ticker_store.get(sym) if hasattr(ticker_store, 'get') else {}
-                    ob = orderbooks.get(sym)
+                    ob = ob_store.get_sync(sym)
                     replay_engine.save_snapshot(
                         symbol=sym,
                         ticker=ticker,

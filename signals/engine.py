@@ -9,10 +9,8 @@ from collections import defaultdict
 
 from core import Event, MarketDataBus, SignalResult, get_bus
 from core.adaptive import get_volatility_tracker
-from scanner.candles import candle_buffer, CandleBuffer
-from scanner.ticker import ticker_store, liquidation_store
-from scanner.trades import whale_tracker
-from scanner.orderbook import orderbooks
+from core.storage import get_candle_store, get_ticker_store, get_ob_store
+from core.storage import get_liquidation_store, get_whale_tracker
 from signals import (
     BaseSignal,
     SignalContext,
@@ -108,16 +106,16 @@ class SignalEngine:
 
     async def _build_context(self, symbol: str, exchange: str) -> SignalContext:
         """Собрать все доступные данные для символа."""
-        candles_1m = candle_buffer.get(symbol, "1", 60)
-        candles_5m = candle_buffer.get(symbol, "5", 30)
-        candles_15m = candle_buffer.get(symbol, "15", 30)
+        candles_1m = get_candle_store().get_sync(symbol, "1", 60)
+        candles_5m = get_candle_store().get_sync(symbol, "5", 30)
+        candles_15m = get_candle_store().get_sync(symbol, "15", 30)
 
         # Берём тикер из stores
-        ticker = ticker_store.get(symbol)
-        ob = orderbooks.get(symbol)
-        whales = whale_tracker.get_whales(symbol, threshold=100_000)
-        cvd = whale_tracker.get_cvd(symbol)
-        liqs = liquidation_store.recent(minutes=5)
+        ticker = get_ticker_store().get_sync(symbol)
+        ob = get_ob_store().get_sync(symbol)
+        whales = get_whale_tracker().get_whales(symbol, threshold=100_000)
+        cvd = get_whale_tracker().get_cvd(symbol)
+        liqs = get_liquidation_store().recent(minutes=5)
 
         # Обновляем VolatilityTracker для Adaptive Thresholds
         price = 0.0
